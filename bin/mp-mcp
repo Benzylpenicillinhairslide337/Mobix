@@ -1,19 +1,36 @@
 #!/usr/bin/env python3
 """
-MCP server exposing captured mobile traffic to Claude Code.
+MCP server for the mobile pentest lab: traffic analysis PLUS full control
+plane (scan/switch/install, bypass toggles, Burp/MobSF, credential push,
+Claude Code engagements).
 
-Wires the lab straight into a Claude Code session: instead of running `mp brief`
-and pasting a path, Claude can query the live capture directly — list flows,
-pull one request in full, search bodies, read the ranked brief.
+Wires the lab straight into a Claude Code session: instead of running `mp`
+commands by hand, Claude can query the live capture and drive the lab
+directly — list flows, pull one request in full, start a scan, toggle a
+bypass module, switch target, push a stored credential into a focused field.
 
-Speaks MCP over stdio as newline-delimited JSON-RPC, implemented directly so the
-server has no dependencies beyond the standard library.
+Speaks MCP over stdio as newline-delimited JSON-RPC, implemented directly so
+the server has no dependencies beyond the standard library.
 
 Register once:
-  claude mcp add --scope user mp-traffic ~/mobile-pentest/bin/mp-mcp
+  claude mcp add --scope user mobix ~/mobile-pentest/bin/mp-mcp
 
-Everything is read-only. Nothing here launches apps, sends requests, or mutates
-the device — analysis only.
+Scope, deliberately:
+- The `traffic_*` tools are read-only.
+- Every mutating tool below shells out to the same whitelisted `mp` / helper-
+  script commands the CLI and web dashboard already use — no new code paths,
+  no free-form shell. Package names and hosts are regex-validated before
+  they reach a subprocess argv (never a shell string).
+- Raw shell (`mp shell`), objection/logcat (interactive, no clean
+  request/response shape) and any tool that would return a plaintext stored
+  credential are intentionally NOT exposed here. `creds_list` shows only
+  labels/types (passwords masked, TOTP shown as a live rotating code exactly
+  like `creds.py show` without `--reveal`); `creds_send` types a stored value
+  into the on-device field currently focused without ever returning it.
+- Every write here is real: `target_scan`, `target_switch`, `target_install`
+  force-stop whatever was previously hooked and start a fresh capture
+  session, same as the CLI/dashboard. Only point this at devices/apps you
+  are authorised to test.
 """
 from __future__ import annotations
 
@@ -28,8 +45,14 @@ from pathlib import Path
 ROOT = Path(os.environ.get("MP_ROOT", Path.home() / "mobile-pentest"))
 LOOT = ROOT / "loot"
 SCRIPTS = ROOT / "scripts"
+MP = str(ROOT / "bin" / "mp")
 PROTOCOL_DEFAULT = "2025-06-18"
 MAX_BODY = 6000
+PKG_RE = re.compile(r"^[A-Za-z0-9_.]{1,128}$")
+HOST_RE = re.compile(r"^[A-Za-z0-9_.,:-]{0,200}$")
+LABEL_RE = re.compile(r"^[^\x00-\x1f]{1,80}$")
+BYPASS_KEY_RE = re.compile(r"^(anti\.)?[A-Za-z0-9_.-]{1,40}$")
+PORT_RE = re.compile(r"^[0-9]{1,5}$")
 
 
 def err(msg: str) -> None:
@@ -119,6 +142,298 @@ def decode_wrapped(txt: str) -> list[dict]:
 def clip(s, n=MAX_BODY):
     s = s or ""
     return s if len(s) <= n else s[:n] + f"\n…[{len(s)-n} more bytes]"
+
+
+# ---------------------------------------------------------------- control-plane helpers
+def sh(cmd: list[str], timeout: int = 60) -> tuple[int, str]:
+    """Run an argv list (never a shell string) and return (rc, combined output)."""
+    try:
+        p = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
+        return p.returncode, ((p.stdout or "") + (p.stderr or "")).strip()
+    except subprocess.TimeoutExpired:
+        return -1, f"timed out after {timeout}s"
+    except Exception as e:
+        return -1, str(e)
+
+
+def device_serial() -> str:
+    """Same resolution env.sh gives the CLI/dashboard (adb devices, falling
+    back to asking mumu-cli for the port), so all three surfaces agree."""
+    rc, out = sh(["bash", "-c", f'. "{SCRIPTS}/env.sh"; echo "$MP_DEVICE"'], 20)
+    return out.strip().splitlines()[-1] if out.strip() else "emulator-5554"
+
+
+def adb(args: list[str], timeout: int = 20) -> str:
+    return sh(["adb", "-s", device_serial(), *args], timeout)[1]
+
+
+def conf() -> dict:
+    d = {}
+    f = ROOT / "config"
+    if f.exists():
+        for line in f.read_text().splitlines():
+            if "=" in line and not line.startswith("#"):
+                k, _, v = line.partition("=")
+                d[k.strip()] = v.strip().strip('"')
+    return d
+
+
+def result(ok: bool, out: str) -> str:
+    return json.dumps({"ok": ok, "out": out}, ensure_ascii=False)
+
+
+def bad(msg: str) -> str:
+    return json.dumps({"ok": False, "out": msg})
+
+
+# ---------------------------------------------------------------- read-only lab state
+def t_lab_status(_) -> str:
+    dev = device_serial()
+    online = "device" in adb(["get-state"], 8)
+    c = conf()
+    st = {
+        "device": dev if online else None,
+        "online": online,
+        "android": adb(["shell", "getprop", "ro.build.version.release"], 8).strip() if online else "",
+        "abi": adb(["shell", "getprop", "ro.product.cpu.abi"], 8).strip() if online else "",
+        "root": online and adb(["shell", "id", "-u"], 8).strip() == "0",
+        "frida_server_running": online and bool(adb(["shell", "pgrep", "-f", "frida-server"], 8).strip()),
+        "device_proxy": adb(["shell", "settings", "get", "global", "http_proxy"], 8).strip() if online else "",
+        "system_ca_installed": online and "No such" not in adb(
+            ["shell", "ls", "/system/etc/security/cacerts/c8750f0d.0"], 8),
+        "target": c.get("TARGET", ""),
+        "scope": c.get("SCOPE", ""),
+    }
+    return json.dumps(st, indent=2)
+
+
+def t_lab_apps(_) -> str:
+    """Packages installed ON THE EMULATOR (never host/macOS apps)."""
+    out = adb(["shell", "pm", "list", "packages", "-3"], 25)
+    pkgs = sorted(l.replace("package:", "").strip()
+                  for l in out.splitlines() if l.startswith("package:"))
+    running = adb(["shell", "ps", "-A", "-o", "NAME"], 20)
+    apps = [{"pkg": p, "running": p in running} for p in pkgs if PKG_RE.match(p)]
+    return json.dumps(apps, indent=2)
+
+
+def t_bypass_list(_) -> str:
+    rc, out = sh(["python3", str(SCRIPTS / "bypass.py"), "--list"], 30)
+    try:
+        return json.dumps(json.loads(out[out.index("{"):]), indent=2)
+    except Exception:
+        return bad(out or "bypass.py --list failed")
+
+
+def t_engage_findings(a: dict) -> str:
+    base = ROOT / "engagements"
+    engs = sorted((d for d in base.glob("*") if d.is_dir()),
+                  key=lambda p: p.stat().st_mtime, reverse=True) if base.exists() else []
+    if not engs:
+        return json.dumps({"engagement": None, "findings": []})
+    e = engs[0]
+    fdir = e / "findings"
+    out = []
+    for f in sorted(fdir.glob("*.md"), reverse=True) if fdir.exists() else []:
+        out.append({"file": f.name, "text": f.read_text()[:6000] if a.get("full_text") else None,
+                    "excerpt": f.read_text()[:400]})
+    return json.dumps({"engagement": e.name, "count": len(out), "findings": out}, indent=2, ensure_ascii=False)
+
+
+# ---------------------------------------------------------------- targeting / lifecycle
+def t_lab_up(_) -> str:
+    rc, out = sh([MP, "up"], 300)
+    return result(rc == 0, out)
+
+
+def t_lab_down(_) -> str:
+    rc, out = sh([MP, "down"], 300)
+    return result(rc == 0, out)
+
+
+def t_lab_stop(_) -> str:
+    rc, out = sh([MP, "stop"], 300)
+    return result(rc == 0, out)
+
+
+def t_lab_go(_) -> str:
+    """Boot emulator if needed, hook the current target, start capture (reuses a live capture)."""
+    rc, out = sh([MP, "go"], 400)
+    return result(rc == 0, out)
+
+
+def t_target_set(a: dict) -> str:
+    pkg = a.get("pkg") or ""
+    if not PKG_RE.match(pkg):
+        return bad("invalid package name")
+    rc, out = sh([MP, "target", pkg], 30)
+    return result(rc == 0, out)
+
+
+def t_target_switch(a: dict) -> str:
+    """Switch capture to an ALREADY-INSTALLED app: force-stops the old capture,
+    starts a fresh session, launches the new target hooked."""
+    pkg = a.get("pkg") or ""
+    if not PKG_RE.match(pkg):
+        return bad("invalid package name")
+    rc, out = sh([MP, "switch", pkg], 500)
+    return result(rc == 0, out)
+
+
+def t_target_scan(a: dict) -> str:
+    """Full `mp scan` flow: environment up, resolve/install the target if
+    needed, force-stop whatever was hooked before, fresh capture session,
+    launch hooked. Requires an explicit target - no interactive picker here."""
+    src = a.get("target") or ""
+    if not src:
+        return bad("target is required (package name, .apk/.xapk path, APK URL, or Play Store link)")
+    rc, out = sh([MP, "scan", src], 600)
+    return result(rc == 0, out)
+
+
+def t_target_scope(a: dict) -> str:
+    host = a.get("host") or ""
+    if not HOST_RE.match(host):
+        return bad("invalid scope")
+    rc, out = sh([MP, "scope", host], 30)
+    return result(rc == 0, out)
+
+
+def t_target_install(a: dict) -> str:
+    src = a.get("source") or ""
+    if not src:
+        return bad("source is required (.apk/.xapk path, APK URL, or Play Store link)")
+    args = [str(SCRIPTS / "install-app.sh"), src]
+    if a.get("passive"):
+        args.append("--passive")
+    rc, out = sh(args, 600)
+    return result(rc == 0, out)
+
+
+def t_target_pull(a: dict) -> str:
+    pkg = a.get("pkg") or conf().get("TARGET", "")
+    if not PKG_RE.match(pkg or ""):
+        return bad("invalid package name")
+    rc, out = sh([MP, "pull", pkg], 600)
+    return result(rc == 0, out)
+
+
+def t_target_launch(a: dict) -> str:
+    pkg = a.get("pkg") or conf().get("TARGET", "")
+    if not PKG_RE.match(pkg or ""):
+        return bad("invalid package name")
+    rc, out = sh([MP, "launch", pkg], 400)
+    return result(rc == 0, out)
+
+
+def t_target_static(a: dict) -> str:
+    apk = a.get("apk") or ""
+    args = [MP, "static"] + ([apk] if apk else [])
+    rc, out = sh(args, 400)
+    return result(rc == 0, out)
+
+
+# ---------------------------------------------------------------- bypass
+def t_bypass_set(a: dict) -> str:
+    key = a.get("key") or ""
+    if not BYPASS_KEY_RE.match(key):
+        return bad("invalid module key")
+    on = bool(a.get("on"))
+    rc, out = sh(["python3", str(SCRIPTS / "bypass.py"), "--set", f"{key}={'1' if on else '0'}"], 30)
+    return result(rc == 0, out or f"{key} -> {'on' if on else 'off'} (applies on next launch)")
+
+
+def t_bypass_reset(_) -> str:
+    rc, out = sh(["python3", str(SCRIPTS / "bypass.py"), "--reset"], 30)
+    return result(rc == 0, "all bypass modules re-enabled")
+
+
+# ---------------------------------------------------------------- Burp / MobSF
+def t_burp_switch(a: dict) -> str:
+    port = str(a.get("port") or "8080")
+    if not PORT_RE.match(port) or not (1 <= int(port) <= 65535):
+        return bad("invalid port")
+    rc, out = sh([MP, "burp", port], 30)
+    return result(rc == 0, out)
+
+
+def t_burp_mitm(_) -> str:
+    rc, out = sh([MP, "burp", "--mitm"], 30)
+    return result(rc == 0, out)
+
+
+def t_mobsf_start(_) -> str:
+    rc, out = sh([MP, "mobsf", "start"], 300)
+    return result(rc == 0, out)
+
+
+# ---------------------------------------------------------------- Claude Code engagements
+def t_engage_start(a: dict) -> str:
+    pkg = a.get("pkg") or conf().get("TARGET", "")
+    if not PKG_RE.match(pkg or ""):
+        return bad("invalid package name")
+    mode = a.get("mode") or "auto"
+    if mode == "auto":
+        rc, out = sh([MP, "engage", pkg, "--auto"], 120)
+    elif mode == "interactive":
+        rc, out = sh([MP, "engage", pkg], 60)
+    else:
+        return bad("mode must be 'auto' or 'interactive'")
+    return result(rc == 0, out)
+
+
+def t_engage_stop(_) -> str:
+    rc, out = sh([MP, "engage", "--stop"], 60)
+    return result(rc == 0, out)
+
+
+# ---------------------------------------------------------------- credentials
+# No tool here ever returns a stored plaintext password/TOTP secret - see the
+# module docstring. creds_list mirrors `creds.py show` (masked); creds_send
+# mirrors `creds.py type` (pushes into the device, never echoes the value).
+def t_creds_list(a: dict) -> str:
+    pkg = a.get("pkg") or ""
+    if not PKG_RE.match(pkg):
+        return bad("invalid package name")
+    rc, out = sh([str(SCRIPTS / "creds.py"), "show", pkg], 15)
+    return result(rc == 0, out)
+
+
+def t_creds_set(a: dict) -> str:
+    pkg, label, value = a.get("pkg") or "", a.get("label") or "", a.get("value")
+    if not PKG_RE.match(pkg):
+        return bad("invalid package name")
+    if not LABEL_RE.match(label):
+        return bad("invalid label")
+    if value is None:
+        return bad("value is required")
+    ftype = a.get("type") if a.get("type") in ("text", "password", "totp") else "text"
+    rc, out = sh([str(SCRIPTS / "creds.py"), "set", pkg, label, str(value), "--type", ftype], 15)
+    return result(rc == 0, out)
+
+
+def t_creds_remove(a: dict) -> str:
+    pkg, label = a.get("pkg") or "", a.get("label") or ""
+    if not PKG_RE.match(pkg) or not LABEL_RE.match(label):
+        return bad("invalid package name or label")
+    rc, out = sh([str(SCRIPTS / "creds.py"), "rm", pkg, label], 15)
+    return result(rc == 0, out)
+
+
+def t_creds_send(a: dict) -> str:
+    """Tap the target field on the device FIRST, then call this - it types
+    that field's stored value (or, for a totp field, the current code) into
+    whatever is focused. Never returns the value itself."""
+    pkg, label = a.get("pkg") or "", a.get("label") or ""
+    if not PKG_RE.match(pkg) or not LABEL_RE.match(label):
+        return bad("invalid package name or label")
+    rc, out = sh([str(SCRIPTS / "creds.py"), "type", pkg, label], 15)
+    return result(rc == 0, "sent" if rc == 0 else out)
+
+
+def t_creds_bring_front(_) -> str:
+    rc, out = sh([str(SCRIPTS / "creds.py"), "front"], 15)
+    return result(rc == 0, out or "brought MuMu Player Pro to the front")
 
 
 # ---------------------------------------------------------------- tools
@@ -310,6 +625,176 @@ TOOLS = [
                      "properties": {"session": {"type": "string"},
                                     "rebuild": {"type": "boolean"}}},
      "fn": t_brief},
+
+    {"name": "lab_status",
+     "description": "Device/environment state: online, root, Android version/ABI, frida-server "
+                    "running, device proxy, system CA installed, current target + scope.",
+     "inputSchema": {"type": "object", "properties": {}},
+     "fn": t_lab_status},
+    {"name": "lab_apps",
+     "description": "Third-party packages installed on the Android device/emulator, with which "
+                    "are currently running. Never host/macOS apps.",
+     "inputSchema": {"type": "object", "properties": {}},
+     "fn": t_lab_apps},
+    {"name": "lab_up",
+     "description": "Bring the environment up (boot emulator if needed, start frida-server, "
+                    "verify CA) WITHOUT switching target or capture.",
+     "inputSchema": {"type": "object", "properties": {}},
+     "fn": t_lab_up},
+    {"name": "lab_down",
+     "description": "Stop everything and remove the device-wide proxy setting.",
+     "inputSchema": {"type": "object", "properties": {}},
+     "fn": t_lab_down},
+    {"name": "lab_stop",
+     "description": "Stop hooks and capture (leaves the emulator running).",
+     "inputSchema": {"type": "object", "properties": {}},
+     "fn": t_lab_stop},
+    {"name": "lab_go",
+     "description": "Boot emulator if needed, hook the CURRENT target, start capture - reuses a "
+                    "live capture session rather than starting a fresh one (use target_scan for that).",
+     "inputSchema": {"type": "object", "properties": {}},
+     "fn": t_lab_go},
+
+    {"name": "target_set",
+     "description": "Set the target package WITHOUT touching capture/hooks (just changes what "
+                    "later commands default to). Use target_switch or target_scan to actually re-hook.",
+     "inputSchema": {"type": "object", "properties": {"pkg": {"type": "string"}}, "required": ["pkg"]},
+     "fn": t_target_set},
+    {"name": "target_switch",
+     "description": "Switch capture to an ALREADY-INSTALLED app: force-stops whatever was hooked "
+                    "before, starts a fresh capture session, launches the new target hooked.",
+     "inputSchema": {"type": "object", "properties": {"pkg": {"type": "string"}}, "required": ["pkg"]},
+     "fn": t_target_switch},
+    {"name": "target_scan",
+     "description": "Start a full fresh scan: environment up, resolve/install the target if "
+                    "needed, force-stop whatever was hooked before, fresh capture session, launch "
+                    "hooked. This is the same flow as `mp scan`/the dashboard's New Scan. Takes a "
+                    "while (emulator boot + install + hook) - can take several minutes on first run.",
+     "inputSchema": {"type": "object", "properties": {
+         "target": {"type": "string", "description": "package name (fuzzy match ok), .apk/.xapk "
+                    "path, direct APK URL, or Play Store link"}},
+         "required": ["target"]},
+     "fn": t_target_scan},
+    {"name": "target_scope",
+     "description": "Set (or clear, with an empty string) the capture scope: comma-separated host "
+                    "substrings. Narrows both capture and analysis to matching hosts.",
+     "inputSchema": {"type": "object", "properties": {"host": {"type": "string"}}, "required": ["host"]},
+     "fn": t_target_scope},
+    {"name": "target_install",
+     "description": "Install an app from an .apk/.xapk/.apkm/.apks path, a direct APK URL, or a "
+                    "Play Store link. Runs static analysis after; hooks it with a live capture "
+                    "unless passive=true.",
+     "inputSchema": {"type": "object", "properties": {
+         "source": {"type": "string"},
+         "passive": {"type": "boolean", "description": "static analysis only, no hooking/capture"}},
+         "required": ["source"]},
+     "fn": t_target_install},
+    {"name": "target_pull",
+     "description": "Pull the base + split APKs for a package into apks/<pkg>/.",
+     "inputSchema": {"type": "object", "properties": {"pkg": {"type": "string",
+                     "description": "defaults to the current target"}}},
+     "fn": t_target_pull},
+    {"name": "target_launch",
+     "description": "Launch the target hooked only (detached, root+SSL bypass active), without "
+                    "starting a new capture session.",
+     "inputSchema": {"type": "object", "properties": {"pkg": {"type": "string",
+                     "description": "defaults to the current target"}}},
+     "fn": t_target_launch},
+    {"name": "target_static",
+     "description": "Static analysis only (apktool + jadx + apkleaks): manifest flags, exported "
+                    "components, network-security-config, pinning call sites, native libs.",
+     "inputSchema": {"type": "object", "properties": {"apk": {"type": "string",
+                     "description": "path to an APK; defaults to the current target's pulled APK"}}},
+     "fn": t_target_static},
+
+    {"name": "bypass_list",
+     "description": "Current state of every Frida bypass script and anti-detection sub-module.",
+     "inputSchema": {"type": "object", "properties": {}},
+     "fn": t_bypass_list},
+    {"name": "bypass_set",
+     "description": "Toggle one bypass module on/off. Applies on the next launch (target_launch / "
+                    "target_switch / target_scan), not to an already-running hook.",
+     "inputSchema": {"type": "object", "properties": {
+         "key": {"type": "string", "description": "module key from bypass_list, e.g. "
+                 "'certificate-unpinning' or 'anti.Build'"},
+         "on": {"type": "boolean"}},
+         "required": ["key", "on"]},
+     "fn": t_bypass_set},
+    {"name": "bypass_reset",
+     "description": "Re-enable every bypass module.",
+     "inputSchema": {"type": "object", "properties": {}},
+     "fn": t_bypass_reset},
+
+    {"name": "burp_switch",
+     "description": "Point the device at Burp instead of mitmproxy: installs Burp's CA into the "
+                    "system trust store, updates the Frida-injected cert, repoints the device "
+                    "proxy. Burp must already be running with its proxy listener bound to all "
+                    "interfaces.",
+     "inputSchema": {"type": "object", "properties": {"port": {"type": "integer",
+                     "description": "defaults to 8080"}}},
+     "fn": t_burp_switch},
+    {"name": "burp_mitm",
+     "description": "Switch the device back from Burp to mitmproxy.",
+     "inputSchema": {"type": "object", "properties": {}},
+     "fn": t_burp_mitm},
+    {"name": "mobsf_start",
+     "description": "Start the MobSF container (http://127.0.0.1:8010, creds mobsf/mobsf). First "
+                    "run pulls the image and can take a while.",
+     "inputSchema": {"type": "object", "properties": {}},
+     "fn": t_mobsf_start},
+
+    {"name": "engage_start",
+     "description": "Start a Claude Code engagement for the target: its own folder, live traffic "
+                    "wired in via this same MCP server, pentest skills active. mode='auto' runs a "
+                    "headless agent (analysis-only, no Bash, no request sending) that reviews the "
+                    "live capture and writes findings - read them back with engage_findings. "
+                    "mode='interactive' opens a real terminal session for a human to drive.",
+     "inputSchema": {"type": "object", "properties": {
+         "pkg": {"type": "string", "description": "defaults to the current target"},
+         "mode": {"type": "string", "enum": ["auto", "interactive"]}}},
+     "fn": t_engage_start},
+    {"name": "engage_stop",
+     "description": "Stop any running engagement agents.",
+     "inputSchema": {"type": "object", "properties": {}},
+     "fn": t_engage_stop},
+    {"name": "engage_findings",
+     "description": "Findings written by the most recent engagement (interactive or auto), newest "
+                    "first. Returns a short excerpt per finding by default; pass full_text for the "
+                    "complete report of each.",
+     "inputSchema": {"type": "object", "properties": {"full_text": {"type": "boolean"}}},
+     "fn": t_engage_findings},
+
+    {"name": "creds_list",
+     "description": "Stored credential field labels/types for an app - like `creds.py show` "
+                    "without --reveal: password fields masked, TOTP shown as a live rotating code, "
+                    "never the raw secret. Never returns a plaintext stored password.",
+     "inputSchema": {"type": "object", "properties": {"pkg": {"type": "string"}}, "required": ["pkg"]},
+     "fn": t_creds_list},
+    {"name": "creds_set",
+     "description": "Create or update a stored credential field for an app (local, unencrypted, "
+                    "test/throwaway accounts only - not a vault).",
+     "inputSchema": {"type": "object", "properties": {
+         "pkg": {"type": "string"}, "label": {"type": "string"}, "value": {"type": "string"},
+         "type": {"type": "string", "enum": ["text", "password", "totp"]}},
+         "required": ["pkg", "label", "value"]},
+     "fn": t_creds_set},
+    {"name": "creds_remove",
+     "description": "Remove a stored credential field.",
+     "inputSchema": {"type": "object", "properties": {
+         "pkg": {"type": "string"}, "label": {"type": "string"}}, "required": ["pkg", "label"]},
+     "fn": t_creds_remove},
+    {"name": "creds_send",
+     "description": "Tap/focus the target field on the device FIRST, then call this: types that "
+                    "field's stored value (or, for a totp field, the current code) into whatever "
+                    "is focused. Never returns the value itself.",
+     "inputSchema": {"type": "object", "properties": {
+         "pkg": {"type": "string"}, "label": {"type": "string"}}, "required": ["pkg", "label"]},
+     "fn": t_creds_send},
+    {"name": "creds_bring_front",
+     "description": "Bring MuMu Player Pro to the front (it's a normal window - click into it and "
+                    "type directly, or use creds_send to push a stored value into a focused field).",
+     "inputSchema": {"type": "object", "properties": {}},
+     "fn": t_creds_bring_front},
 ]
 BY_NAME = {t["name"]: t for t in TOOLS}
 
@@ -334,7 +819,7 @@ def handle(msg: dict) -> None:
         return reply(mid, {
             "protocolVersion": ver,
             "capabilities": {"tools": {}},
-            "serverInfo": {"name": "mp-traffic", "version": "1.0.0"},
+            "serverInfo": {"name": "mobix", "version": "2.0.0"},
         })
     if m in ("notifications/initialized", "initialized"):
         return  # notification: no reply
@@ -362,7 +847,7 @@ def handle(msg: dict) -> None:
 
 
 def main() -> int:
-    err(f"serving traffic from {LOOT}")
+    err(f"mobix control plane - traffic from {LOOT}, mp at {MP}")
     for line in sys.stdin:
         line = line.strip()
         if not line:

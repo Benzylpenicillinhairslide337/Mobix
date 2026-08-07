@@ -598,24 +598,49 @@ same care as `replay.py --send`: know what you're sending before you click it.
 
 Three routes, increasing directness:
 
-**1. MCP server (live, no file paths).** `bin/mp-mcp` is registered as the
-`mp-traffic` MCP server, so any Claude Code session can query the capture
-directly:
+**1. MCP server — full control plane.** `bin/mp-mcp` is a single MCP server
+(34 tools) covering both traffic analysis and everything the CLI/dashboard can
+do — register it once and drive the whole lab from chat:
 
-| tool | what it does |
-|---|---|
-| `traffic_status` | session, flow count, target, scope, hosts, per-app counts |
-| `traffic_sessions` | all capture sessions |
-| `traffic_flows` | list requests; filter by app, host, method, substring, unauthenticated-only |
-| `traffic_flow` | one request in full, base64 payloads decoded |
-| `traffic_search` | search bodies and headers, with context |
-| `traffic_brief` | the ranked brief |
+```bash
+claude mcp add --scope user mobix ~/mobile-pentest/bin/mp-mcp
+```
 
-Just ask: *"use traffic_flows to show unauthenticated requests"*. Read-only —
-nothing launches apps, sends requests, or touches the device.
+*(Already registered it under the old name? `mp-traffic` still works —
+same binary, same tools, just a different local alias. No need to re-add.)*
+
+| group | tools | what it does |
+|---|---|---|
+| traffic (read-only) | `traffic_status` `traffic_sessions` `traffic_flows` `traffic_flow` `traffic_search` `traffic_brief` | query the live capture — session state, list/filter/search requests, one request in full with payloads decoded, the ranked brief |
+| lab lifecycle | `lab_status` `lab_apps` `lab_up` `lab_down` `lab_stop` `lab_go` | device/environment state, installed apps, bring the environment up/down without necessarily touching target/capture |
+| targeting | `target_set` `target_switch` `target_scan` `target_scope` `target_install` `target_pull` `target_launch` `target_static` | set/switch/scan the target (same flow as `mp scan`/New Scan — force-stops the old capture, starts fresh), install an app, pull its APK, static analysis |
+| bypass | `bypass_list` `bypass_set` `bypass_reset` | read/toggle the Frida scripts and anti-detection modules |
+| Burp / MobSF | `burp_switch` `burp_mitm` `mobsf_start` | hand traffic to Burp and back, start MobSF |
+| engagements | `engage_start` `engage_stop` `engage_findings` | start/stop a Claude Code engagement, read back its findings |
+| credentials | `creds_list` `creds_set` `creds_remove` `creds_send` `creds_bring_front` | manage stored test creds and push a value into a focused device field — **never returns a stored plaintext password/TOTP secret**, see below |
+
+Just ask: *"use target_scan to start a fresh scan on com.example.app"* or *"use
+traffic_flows to show unauthenticated requests"*.
+
+**Deliberately not exposed**, even under "full control plane": raw `mp shell`
+(arbitrary command execution), `objection`/`logcat` (interactive, no clean
+request/response shape), and any tool that would return a plaintext stored
+credential. Every mutating tool shells out to the exact same whitelisted `mp` /
+helper-script commands the CLI and dashboard already use — package names and
+hosts are regex-validated before they ever reach a subprocess argv, never a
+shell string. `creds_list` mirrors `creds.py show` (passwords masked, TOTP
+shown as a live rotating code, never the raw secret); `creds_send` types a
+stored value into the on-device field currently focused without ever echoing
+it back.
+
+The headless `--auto` engagement agent (below) keeps its original safety
+property regardless of this expansion: its `--allowedTools` allowlist names
+the 6 `traffic_*` tools explicitly, not a wildcard, so it still can't reach
+any of the new mutating tools — no Bash, no request sending, no scan/switch/
+credential actions.
 
 Re-register after moving the directory:
-`claude mcp add --scope user mp-traffic ~/mobile-pentest/bin/mp-mcp`
+`claude mcp add --scope user mobix ~/mobile-pentest/bin/mp-mcp`
 
 **2. Dashboard button.** **Analyse with Claude** in the Traffic toolbar runs the
 session brief through `claude -p` headlessly and renders the analysis in the
