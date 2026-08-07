@@ -17,12 +17,11 @@ allowlist for the unattended path. One line to install, one command to scan.
 </p>
 
 <p align="center">
-  <img src="docs/screenshots/claude-analysis-findings.jpg" width="49%" alt="Claude Analysis tab: live findings list with severities and a hero card for the latest finding">
-  <img src="docs/screenshots/traffic.jpg" width="49%" alt="Traffic tab: site-map tree, captured requests, and a decoded request/response detail pane">
+  <img src="docs/screenshots/demo.gif" width="90%" alt="Demo: clicking a captured request auto-flags it as an IDOR candidate, then the Claude Analysis tab shows the same finding written up with severity">
 </p>
 
-> All screenshots on this page use a synthetic demo app/traffic/findings — no real
-> target data. See [Screenshots](#screenshots) below for the full set, one per tab.
+> Synthetic demo app/traffic/findings throughout — no real target data. See
+> [Screenshots](#screenshots) below for the full set, one per tab.
 
 **If this is useful to you, a ⭐ helps other pentesters find it — genuinely
 appreciated.**
