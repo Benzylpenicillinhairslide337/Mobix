@@ -1,0 +1,383 @@
+#!/usr/bin/env python3
+"""
+MCP server exposing captured mobile traffic to Claude Code.
+
+Wires the lab straight into a Claude Code session: instead of running `mp brief`
+and pasting a path, Claude can query the live capture directly — list flows,
+pull one request in full, search bodies, read the ranked brief.
+
+Speaks MCP over stdio as newline-delimited JSON-RPC, implemented directly so the
+server has no dependencies beyond the standard library.
+
+Register once:
+  claude mcp add --scope user mp-traffic ~/mobile-pentest/bin/mp-mcp
+
+Everything is read-only. Nothing here launches apps, sends requests, or mutates
+the device — analysis only.
+"""
+from __future__ import annotations
+
+import base64
+import json
+import os
+import re
+import subprocess
+import sys
+from pathlib import Path
+
+ROOT = Path(os.environ.get("MP_ROOT", Path.home() / "mobile-pentest"))
+LOOT = ROOT / "loot"
+SCRIPTS = ROOT / "scripts"
+PROTOCOL_DEFAULT = "2025-06-18"
+MAX_BODY = 6000
+
+
+def err(msg: str) -> None:
+    print(f"[mp-mcp] {msg}", file=sys.stderr, flush=True)
+
+
+# ---------------------------------------------------------------- data access
+def sessions() -> list[Path]:
+    return sorted((d for d in LOOT.glob("session-*") if (d / "flows.jsonl").exists()),
+                  key=lambda p: p.stat().st_mtime, reverse=True)
+
+
+def live_session() -> Path | None:
+    """Prefer wherever the running proxy is writing - but only once it has
+    captured something. An empty live session (or one scoped so nothing
+    matches) must not mask earlier sessions that do have traffic."""
+    live = None
+    try:
+        out = subprocess.run(
+            ["bash", "-c",
+             "ps -eo args | grep '[m]itmdump' | tr ' ' '\\n' | grep -m1 '^feedout=' | cut -d= -f2-"],
+            capture_output=True, text=True, timeout=10).stdout.strip()
+        if out:
+            cand = Path(out.splitlines()[-1])
+            f = cand / "flows.jsonl"
+            if f.exists() and f.stat().st_size:
+                return cand
+            live = cand if cand.exists() else None
+    except Exception:
+        pass
+    for s in sessions():
+        if (s / "flows.jsonl").stat().st_size:
+            return s
+    return live
+
+
+def resolve(name: str | None) -> Path | None:
+    if not name:
+        return live_session()
+    p = Path(name)
+    if p.is_dir():
+        return p
+    p = LOOT / name
+    return p if p.is_dir() else None
+
+
+def load(sess: Path) -> list[dict]:
+    f = sess / "flows.jsonl"
+    if not f.exists():
+        return []
+    rows = []
+    for line in f.open():
+        try:
+            rows.append(json.loads(line))
+        except Exception:
+            continue
+    return rows
+
+
+def decode_wrapped(txt: str) -> list[dict]:
+    """Surface base64-wrapped payloads (requestBody/responseBody and friends)."""
+    out = []
+    if not txt:
+        return out
+    try:
+        doc = json.loads(txt)
+    except Exception:
+        return out
+    if not isinstance(doc, dict):
+        return out
+    for k in ("requestBody", "responseBody", "data", "payload"):
+        v = doc.get(k)
+        if isinstance(v, str) and len(v) > 8:
+            try:
+                dec = base64.b64decode(v, validate=True).decode("utf-8", "replace")
+            except Exception:
+                continue
+            if dec.strip()[:1] in "[{\"":
+                try:
+                    dec = json.dumps(json.loads(dec), ensure_ascii=False, indent=2)
+                except Exception:
+                    pass
+                out.append({"field": k, "decoded": dec[:MAX_BODY]})
+    return out
+
+
+def clip(s, n=MAX_BODY):
+    s = s or ""
+    return s if len(s) <= n else s[:n] + f"\n…[{len(s)-n} more bytes]"
+
+
+# ---------------------------------------------------------------- tools
+def t_status(_) -> str:
+    s = live_session()
+    rows = load(s) if s else []
+    hooked = ""
+    f = ROOT / ".active-app"
+    if f.exists():
+        hooked = f.read_text().strip()
+    cfg = {}
+    c = ROOT / "config"
+    if c.exists():
+        for line in c.read_text().splitlines():
+            if "=" in line and not line.startswith("#"):
+                k, _, v = line.partition("=")
+                cfg[k.strip()] = v.strip().strip('"')
+    hosts = {}
+    apps = {}
+    for r in rows:
+        hosts[r.get("host", "")] = hosts.get(r.get("host", ""), 0) + 1
+        apps[r.get("app") or "(untagged)"] = apps.get(r.get("app") or "(untagged)", 0) + 1
+    return json.dumps({
+        "session": s.name if s else None,
+        "flows": len(rows),
+        "target": cfg.get("TARGET", ""),
+        "scope": cfg.get("SCOPE", ""),
+        "hooked_app": hooked,
+        "hosts": hosts,
+        "apps": apps,
+        "other_sessions": [d.name for d in sessions()[:10]],
+    }, indent=2)
+
+
+def t_sessions(_) -> str:
+    out = []
+    for d in sessions()[:20]:
+        rows = load(d)
+        out.append({"session": d.name, "flows": len(rows),
+                    "hosts": sorted({r.get("host", "") for r in rows})[:8],
+                    "has_brief": (d / "BRIEF.md").exists()})
+    return json.dumps(out, indent=2)
+
+
+def t_flows(a: dict) -> str:
+    sess = resolve(a.get("session"))
+    if not sess:
+        return "no capture session found"
+    rows = load(sess)
+    app = a.get("app")
+    host = a.get("host")
+    method = (a.get("method") or "").upper()
+    contains = (a.get("contains") or "").lower()
+    unauth = a.get("unauthenticated_only")
+    limit = int(a.get("limit") or 100)
+
+    sel = []
+    for r in rows:
+        if app and (r.get("app") or "") != app:
+            continue
+        if host and host.lower() not in (r.get("host") or "").lower():
+            continue
+        if method and (r.get("method") or "") != method:
+            continue
+        if unauth and r.get("authenticated"):
+            continue
+        if contains:
+            hay = " ".join([r.get("path") or "", r.get("req_body") or "",
+                            r.get("res_body") or "", json.dumps(r.get("req_headers") or {})]).lower()
+            if contains not in hay:
+                continue
+        sel.append({
+            "i": r.get("i"), "method": r.get("method"), "host": r.get("host"),
+            "path": r.get("path"), "status": r.get("status"),
+            "app": r.get("app") or "", "auth": r.get("auth_scheme") or "",
+            "req_len": r.get("req_len"), "res_len": r.get("res_len"),
+            "flags": r.get("flag_types") or [], "idor": r.get("idor_candidates") or [],
+        })
+    return json.dumps({"session": sess.name, "matched": len(sel),
+                       "flows": sel[-limit:]}, indent=2)
+
+
+def t_flow(a: dict) -> str:
+    sess = resolve(a.get("session"))
+    if not sess:
+        return "no capture session found"
+    try:
+        idx = int(a.get("index"))
+    except (TypeError, ValueError):
+        return "index must be an integer"
+    for r in load(sess):
+        if r.get("i") != idx:
+            continue
+        out = {k: r.get(k) for k in
+               ("i", "ts", "method", "scheme", "host", "path", "query", "status",
+                "app", "authenticated", "auth_scheme", "req_ct", "res_ct",
+                "req_len", "res_len", "flag_types", "idor_candidates",
+                "req_headers", "res_headers")}
+        out["req_body"] = clip(r.get("req_body"))
+        out["res_body"] = clip(r.get("res_body"))
+        out["req_decoded"] = decode_wrapped(r.get("req_body"))
+        out["res_decoded"] = decode_wrapped(r.get("res_body"))
+        return json.dumps(out, indent=2, ensure_ascii=False)
+    return f"no request #{idx} in {sess.name}"
+
+
+def t_search(a: dict) -> str:
+    sess = resolve(a.get("session"))
+    if not sess:
+        return "no capture session found"
+    q = (a.get("query") or "").lower()
+    if not q:
+        return "query is required"
+    hits = []
+    for r in load(sess):
+        blob = " ".join([
+            r.get("path") or "", json.dumps(r.get("req_headers") or {}),
+            json.dumps(r.get("res_headers") or {}),
+            r.get("req_body") or "", r.get("res_body") or "",
+        ])
+        low = blob.lower()
+        if q in low:
+            i = low.index(q)
+            hits.append({"i": r.get("i"), "method": r.get("method"),
+                         "host": r.get("host"), "path": r.get("path"),
+                         "status": r.get("status"),
+                         "context": blob[max(0, i - 90): i + 190]})
+        if len(hits) >= int(a.get("limit") or 30):
+            break
+    return json.dumps({"session": sess.name, "hits": len(hits), "matches": hits},
+                      indent=2, ensure_ascii=False)
+
+
+def t_brief(a: dict) -> str:
+    sess = resolve(a.get("session"))
+    if not sess:
+        return "no capture session found"
+    if a.get("rebuild") or not (sess / "BRIEF.md").exists():
+        subprocess.run(["python3", str(SCRIPTS / "brief.py"), str(sess)],
+                       capture_output=True, text=True, timeout=180)
+    f = sess / "BRIEF.md"
+    return f.read_text() if f.exists() else "brief could not be generated"
+
+
+TOOLS = [
+    {"name": "traffic_status",
+     "description": "Lab and capture state: active session, flow count, target app, scope, "
+                    "hosts and per-app flow counts. Start here.",
+     "inputSchema": {"type": "object", "properties": {}},
+     "fn": t_status},
+    {"name": "traffic_sessions",
+     "description": "List capture sessions with flow counts and hosts.",
+     "inputSchema": {"type": "object", "properties": {}},
+     "fn": t_sessions},
+    {"name": "traffic_flows",
+     "description": "List captured HTTP requests (compact). Filter by app, host, method, "
+                    "substring, or unauthenticated-only. Use this to find requests worth inspecting.",
+     "inputSchema": {"type": "object", "properties": {
+         "session": {"type": "string", "description": "session name; omit for the live one"},
+         "app": {"type": "string", "description": "package name the flow was attributed to"},
+         "host": {"type": "string"},
+         "method": {"type": "string"},
+         "contains": {"type": "string", "description": "substring in path, body or headers"},
+         "unauthenticated_only": {"type": "boolean",
+                                  "description": "only requests with no Authorization/Cookie"},
+         "limit": {"type": "integer"}}},
+     "fn": t_flows},
+    {"name": "traffic_flow",
+     "description": "Full detail of one request: headers, bodies, and any base64-wrapped "
+                    "payloads decoded, plus flags and IDOR candidates.",
+     "inputSchema": {"type": "object",
+                     "properties": {"index": {"type": "integer", "description": "the flow's # from traffic_flows"},
+                                    "session": {"type": "string"}},
+                     "required": ["index"]},
+     "fn": t_flow},
+    {"name": "traffic_search",
+     "description": "Search request/response bodies and headers for a string (tokens, emails, "
+                    "IDs, parameter names). Returns matching flows with surrounding context.",
+     "inputSchema": {"type": "object",
+                     "properties": {"query": {"type": "string"},
+                                    "session": {"type": "string"},
+                                    "limit": {"type": "integer"}},
+                     "required": ["query"]},
+     "fn": t_search},
+    {"name": "traffic_brief",
+     "description": "The ranked pentest brief for a session: endpoints scored by risk with "
+                    "reasons, plus broken-access-control / IDOR / mass-assignment candidates.",
+     "inputSchema": {"type": "object",
+                     "properties": {"session": {"type": "string"},
+                                    "rebuild": {"type": "boolean"}}},
+     "fn": t_brief},
+]
+BY_NAME = {t["name"]: t for t in TOOLS}
+
+
+# ---------------------------------------------------------------- JSON-RPC
+def reply(mid, result=None, error=None):
+    msg = {"jsonrpc": "2.0", "id": mid}
+    if error is not None:
+        msg["error"] = error
+    else:
+        msg["result"] = result
+    sys.stdout.write(json.dumps(msg) + "\n")
+    sys.stdout.flush()
+
+
+def handle(msg: dict) -> None:
+    m = msg.get("method")
+    mid = msg.get("id")
+
+    if m == "initialize":
+        ver = (msg.get("params") or {}).get("protocolVersion") or PROTOCOL_DEFAULT
+        return reply(mid, {
+            "protocolVersion": ver,
+            "capabilities": {"tools": {}},
+            "serverInfo": {"name": "mp-traffic", "version": "1.0.0"},
+        })
+    if m in ("notifications/initialized", "initialized"):
+        return  # notification: no reply
+    if m == "ping":
+        return reply(mid, {})
+    if m == "tools/list":
+        return reply(mid, {"tools": [{k: t[k] for k in ("name", "description", "inputSchema")}
+                                     for t in TOOLS]})
+    if m == "tools/call":
+        p = msg.get("params") or {}
+        name = p.get("name")
+        args = p.get("arguments") or {}
+        tool = BY_NAME.get(name)
+        if not tool:
+            return reply(mid, error={"code": -32602, "message": f"unknown tool: {name}"})
+        try:
+            text = tool["fn"](args)
+        except Exception as e:
+            err(f"{name} failed: {e}")
+            return reply(mid, {"content": [{"type": "text", "text": f"error: {e}"}],
+                               "isError": True})
+        return reply(mid, {"content": [{"type": "text", "text": text}]})
+    if mid is not None:
+        return reply(mid, error={"code": -32601, "message": f"method not found: {m}"})
+
+
+def main() -> int:
+    err(f"serving traffic from {LOOT}")
+    for line in sys.stdin:
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            msg = json.loads(line)
+        except Exception as e:
+            err(f"bad json: {e}")
+            continue
+        try:
+            handle(msg)
+        except Exception as e:
+            err(f"handler error: {e}")
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

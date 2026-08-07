@@ -1,0 +1,31 @@
+# Engagement data - real captured traffic, credentials, pulled APKs, findings.
+# None of this belongs in a public repo; it's the OUTPUT of the tooling, not
+# the tooling itself.
+/loot/
+/apks/
+/creds/
+/engagements/
+/findings/
+
+# frida-server is a ~50MB third-party binary - install.sh downloads it fresh
+# from Frida's GitHub releases rather than committing it into git history.
+/bin/frida-server-*-arm64
+
+# Runtime/local state
+/config
+/.active-app
+/.capture.pid
+/.launch.pid
+
+# Target-specific, engagement-tailored scripts (e.g. a real target's
+# request-signing key/algorithm reverse-engineered from a live app).
+# Write your own following the pattern documented in the README.
+/scripts/zc-macin.py
+/scripts/*-resign.py
+
+# Python
+__pycache__/
+*.pyc
+
+# OS cruft
+.DS_Store

@@ -1,0 +1,53 @@
+#!/usr/bin/env bash
+# Keeps the lab's device-side state alive. Run by the LaunchAgent every 60s.
+#
+# The CA lives on /system so it survives reboots on its own, but frida-server
+# and the global proxy setting do not survive an emulator restart. This notices
+# the device coming back and restores both, so the lab is ready without having
+# to remember `mp up`.
+#
+# Deliberately does NOT relaunch the target app: hooking an app is an explicit
+# act during a test, not something that should happen behind your back.
+set -uo pipefail
+
+MP_ROOT="${MP_ROOT:-$HOME/mobile-pentest}"
+. "$MP_ROOT/scripts/env.sh"
+LOG="$MP_ROOT/loot/keepalive.log"
+mkdir -p "$(dirname "$LOG")"
+
+say() { echo "[$(date '+%Y-%m-%d %H:%M:%S')] $*" >> "$LOG"; }
+
+# Keep the log from growing without bound.
+[ -f "$LOG" ] && [ "$(wc -c < "$LOG")" -gt 262144 ] && tail -n 300 "$LOG" > "$LOG.tmp" && mv "$LOG.tmp" "$LOG"
+
+export PATH="/opt/homebrew/bin:/usr/bin:/bin:/usr/sbin:/sbin:$PATH"
+command -v adb >/dev/null 2>&1 || { say "adb not on PATH"; exit 0; }
+
+adb start-server >/dev/null 2>&1
+adb -s "$MP_DEVICE" get-state 2>/dev/null | grep -q device || exit 0   # device down, nothing to do
+
+changed=0
+
+if ! adb -s "$MP_DEVICE" shell "pgrep -f frida-server" >/dev/null 2>&1; then
+  adb -s "$MP_DEVICE" shell "nohup /data/local/tmp/frida-server -D >/dev/null 2>&1 &" >/dev/null 2>&1
+  sleep 2
+  if adb -s "$MP_DEVICE" shell "pgrep -f frida-server" >/dev/null 2>&1; then
+    say "frida-server restarted"; changed=1
+  else
+    say "frida-server FAILED to start"
+  fi
+fi
+
+want="${MP_PROXY_HOST}:${MP_PROXY_PORT}"
+have=$(adb -s "$MP_DEVICE" shell "settings get global http_proxy" 2>/dev/null | tr -d '\r')
+if [ "$have" != "$want" ]; then
+  adb -s "$MP_DEVICE" shell "settings put global http_proxy $want" >/dev/null 2>&1
+  say "proxy restored ($have -> $want)"; changed=1
+fi
+
+if ! adb -s "$MP_DEVICE" shell "ls /system/etc/security/cacerts/c8750f0d.0" >/dev/null 2>&1; then
+  say "WARNING: mitmproxy system CA missing - run: mp ca ~/.mitmproxy/mitmproxy-ca-cert.pem"
+fi
+
+[ "$changed" = 1 ] && say "environment restored"
+exit 0

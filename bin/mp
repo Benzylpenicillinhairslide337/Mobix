@@ -1,0 +1,703 @@
+#!/usr/bin/env bash
+# mp - control CLI for the MuMu Android pentest lab.
+#
+# To start a new scan:
+#   mp scan                      no target chosen yet -> opens the app picker
+#   mp scan <pkg>                 an already-installed app
+#   mp scan <apk|url|play-link>   installs it first, then scans it
+#
+# `mp scan` is the one command to reach for. Everything else (mp go, mp
+# switch, mp install, mp launch) is a lower-level piece it's built from -
+# use those directly only when you need finer control.
+#
+# Run `mp help` for the full list.
+set -uo pipefail
+
+MP_ROOT="${MP_ROOT:-$HOME/mobile-pentest}"
+SCRIPTS="$MP_ROOT/scripts"
+CONF="$MP_ROOT/config"
+. "$SCRIPTS/env.sh"
+
+# ---------------------------------------------------------------- config
+# Persisted between runs so the chosen target survives reboots.
+[ -f "$CONF" ] && . "$CONF"
+TARGET="${TARGET:-}"
+SCOPE="${SCOPE:-}"
+
+save_conf() {
+  { echo "# mp config - written by 'mp target' / 'mp apps'"
+    echo "TARGET=\"$TARGET\""
+    echo "SCOPE=\"$SCOPE\""
+    echo "AUTO_MOBSF=\"${AUTO_MOBSF:-0}\""
+  } > "$CONF"
+}
+
+c_ok()   { printf "\033[32m%s\033[0m\n" "$*"; }
+c_warn() { printf "\033[33m%s\033[0m\n" "$*"; }
+c_err()  { printf "\033[31m%s\033[0m\n" "$*"; }
+c_dim()  { printf "\033[2m%s\033[0m\n" "$*"; }
+
+need_target() {
+  [ -n "$TARGET" ] && return 0
+  c_err "No target app selected."
+  echo "Pick one with:  mp apps"
+  exit 1
+}
+
+dev_online() { adb -s "$MP_DEVICE" get-state 2>/dev/null | grep -q device; }
+
+# The newest session dir is not necessarily the live one, so ask the running
+# proxy where it is writing; fall back to the newest dir that has flows.
+active_session() {
+  local d
+  d=$(ps -eo args 2>/dev/null | grep '[m]itmdump' | tr ' ' '\n' | grep -m1 '^feedout=' | cut -d= -f2-)
+  [ -n "$d" ] && { echo "$d"; return 0; }
+  for d in $(ls -td "$MP_LOOT"/session-* 2>/dev/null); do
+    [ -s "$d/flows.jsonl" ] && { echo "$d"; return 0; }
+  done
+  return 1
+}
+
+MUMU_CLI="${MUMU_CLI:-/Applications/MuMuPlayer Pro.app/Contents/MacOS/mumu-cli}"
+MUMU_INDEX="${MUMU_INDEX:-0}"
+
+mumu_state() {
+  [ -x "$MUMU_CLI" ] || { echo unavailable; return; }
+  "$MUMU_CLI" info "$MUMU_INDEX" 2>/dev/null \
+    | jq -r '.return.state // .return.results[0].state // "unknown"' 2>/dev/null || echo unknown
+}
+
+mumu_adb_port() {
+  "$MUMU_CLI" info "$MUMU_INDEX" 2>/dev/null \
+    | jq -r '.return.adb_port // .return.results[0].adb_port // empty' 2>/dev/null
+}
+
+# Boot the emulator itself, then wait for Android to finish coming up.
+ensure_emulator() {
+  local st; st=$(mumu_state)
+  if [ "$st" = "unavailable" ]; then
+    dev_online && return 0
+    c_err "mumu-cli not found at: $MUMU_CLI"
+    echo "  Start MuMu manually, or set MUMU_CLI to the right path."
+    return 1
+  fi
+
+  if [ "$st" != "running" ]; then
+    echo "  starting MuMu instance $MUMU_INDEX (state: $st)..."
+    "$MUMU_CLI" open "$MUMU_INDEX" >/dev/null 2>&1
+  fi
+
+  # "running" means the VM process is up, not that Android has booted. The adb
+  # serial may also differ from the one resolved before the restart, so
+  # re-resolve on every pass rather than trusting the cached value.
+  local i port d
+  for i in $(seq 1 60); do
+    d=$(adb devices 2>/dev/null | awk '$2=="device"{print $1}' | head -1)
+    if [ -z "$d" ] && [ $((i % 4)) -eq 0 ]; then
+      port=$(mumu_adb_port)
+      [ -n "$port" ] && adb connect "127.0.0.1:$port" >/dev/null 2>&1
+    fi
+    if [ -n "$d" ]; then
+      if [ "$d" != "$MP_DEVICE" ]; then
+        echo "  device serial changed: $MP_DEVICE -> $d"
+        MP_DEVICE="$d"; export MP_DEVICE
+      fi
+      [ "$(adb -s "$d" shell getprop sys.boot_completed 2>/dev/null | tr -d '\r')" = "1" ] && return 0
+    fi
+    sleep 3
+  done
+  c_err "timed out waiting for Android to boot"
+  return 1
+}
+
+# ---------------------------------------------------------------- commands
+cmd_up() {
+  local quiet="${1:-}"
+  adb start-server >/dev/null 2>&1
+
+  if ! dev_online || [ "$(A shell getprop sys.boot_completed 2>/dev/null | tr -d '\r')" != "1" ]; then
+    # Keepalive must never boot the emulator behind your back - it only repairs
+    # a device that is already up.
+    if [ "$quiet" = "-q" ]; then exit 0; fi
+    ensure_emulator || exit 1
+  fi
+
+  # frida-server: start only if absent, so an existing session is not broken.
+  if ! A shell "pgrep -f frida-server" >/dev/null 2>&1; then
+    [ "$quiet" != "-q" ] && echo "  starting frida-server..."
+    A shell "nohup /data/local/tmp/frida-server -D >/dev/null 2>&1 &" >/dev/null 2>&1
+    sleep 3
+    A shell "pgrep -f frida-server" >/dev/null 2>&1 || c_err "  frida-server failed to start"
+  fi
+
+  A shell "settings put global http_proxy ${MP_PROXY_HOST}:${MP_PROXY_PORT}" >/dev/null 2>&1
+
+  A shell "ls /system/etc/security/cacerts/c8750f0d.0" >/dev/null 2>&1 || {
+    c_warn "  system CA missing - reinstalling"
+    "$SCRIPTS/install-ca.sh" "$HOME/.mitmproxy/mitmproxy-ca-cert.pem" "$MP_DEVICE" >/dev/null 2>&1 \
+      && c_ok "  CA reinstalled" || c_err "  CA reinstall FAILED"
+  }
+
+  if [ "${AUTO_MOBSF:-0}" = "1" ] && ! docker ps --filter name=mobsf --format '{{.Names}}' 2>/dev/null | grep -q mobsf; then
+    [ "$quiet" != "-q" ] && echo "  starting MobSF..."
+    "$SCRIPTS/mobsf.sh" start >/dev/null 2>&1 &
+  fi
+
+  [ "$quiet" = "-q" ] && exit 0
+  [ "$quiet" = "--brief" ] && return 0
+  cmd_status
+}
+
+cmd_status() {
+  echo
+  printf "  %-14s %s\n" "device" "$(dev_online && echo "$MP_DEVICE  $(A shell getprop ro.build.version.release | tr -d '\r') / $(A shell getprop ro.product.cpu.abi | tr -d '\r')" || echo OFFLINE)"
+  if dev_online; then
+    printf "  %-14s %s\n" "root" "$(A shell id -u | tr -d '\r' | grep -q 0 && echo yes || echo NO)"
+    printf "  %-14s %s\n" "frida-server" "$(A shell 'pgrep -f frida-server' >/dev/null 2>&1 && c_ok running || c_warn stopped)"
+    printf "  %-14s %s\n" "proxy" "$(A shell settings get global http_proxy | tr -d '\r')"
+    printf "  %-14s %s\n" "system CA" "$(A shell 'ls /system/etc/security/cacerts/c8750f0d.0' >/dev/null 2>&1 && c_ok installed || c_warn MISSING)"
+  fi
+  printf "  %-14s %s\n" "target" "${TARGET:-$(c_warn '(none - run: mp apps)')}"
+  [ -n "$SCOPE" ] && printf "  %-14s %s\n" "scope" "$SCOPE"
+  printf "  %-14s %s\n" "hooks" "$(pgrep -f 'frida -U -[fn] ' >/dev/null 2>&1 && c_ok held || echo down)"
+  printf "  %-14s %s\n" "capture" "$(lsof -nP -iTCP:"$MP_PROXY_PORT" -sTCP:LISTEN >/dev/null 2>&1 && c_ok "up :$MP_PROXY_PORT" || echo down)"
+  printf "  %-14s %s\n" "MobSF" "$(docker ps --filter name=mobsf --format '{{.Status}}' 2>/dev/null | head -1 || echo down)"
+  local last; last=$(ls -td "$MP_LOOT"/session-* 2>/dev/null | head -1)
+  [ -n "$last" ] && printf "  %-14s %s\n" "last session" "$(basename "$last")"
+  echo
+}
+
+cmd_apps() {
+  dev_online || { c_err "device offline"; exit 1; }
+  local filter="${1:-}"
+  local list
+  list=$(A shell "pm list packages -3" 2>/dev/null | tr -d '\r' | sed 's/^package://' | sort)
+  [ -n "$filter" ] && list=$(echo "$list" | grep -i "$filter")
+  [ -z "$list" ] && { c_err "no third-party packages match '${filter}'"; exit 1; }
+
+  local pick
+  if command -v fzf >/dev/null 2>&1; then
+    pick=$(echo "$list" | fzf --height=60% --reverse --prompt="target app > " \
+      --header="enter to select, esc to cancel" \
+      --preview "adb -s $MP_DEVICE shell dumpsys package {} 2>/dev/null | grep -E 'versionName|targetSdk|firstInstallTime' | head -4" \
+      --preview-window=down:4)
+  else
+    echo "Installed third-party apps:"; echo "$list" | nl -w3 -s'. '
+    printf "select number (or blank to cancel): "; read -r n
+    [ -z "$n" ] && exit 0
+    pick=$(echo "$list" | sed -n "${n}p")
+  fi
+  [ -z "$pick" ] && { c_dim "cancelled"; exit 0; }
+
+  TARGET="$pick"; save_conf
+  c_ok "target = $TARGET"
+  A shell "dumpsys package $TARGET | grep -E 'versionName|targetSdk'" 2>/dev/null | tr -d '\r' | sed 's/^/  /'
+  [ -z "$SCOPE" ] && c_dim "  tip: set capture scope with 'mp scope <host>' (blank = capture all hosts)"
+  return 0
+}
+
+cmd_dash() {
+  c_dim "dashboard -> http://127.0.0.1:${1:-8090}   (localhost only)"
+  exec python3 "$MP_ROOT/bin/mp-dashboard" ${1:+--port "$1"}
+}
+
+cmd_auto() {
+  case "${1:-show}" in
+    mobsf-on)  AUTO_MOBSF=1; save_conf; c_ok "MobSF will start with 'mp up'" ;;
+    mobsf-off) AUTO_MOBSF=0; save_conf; c_ok "MobSF autostart off" ;;
+    show)      echo "AUTO_MOBSF=${AUTO_MOBSF:-0}" ;;
+    *) echo "usage: mp auto [mobsf-on|mobsf-off|show]"; return 1 ;;
+  esac
+  return 0
+}
+
+cmd_target() {
+  if [ $# -eq 0 ]; then echo "${TARGET:-(none)}"; return 0; fi
+  TARGET="$1"; save_conf; c_ok "target = $TARGET"
+  # A running capture/hook still belongs to the OLD app until you relaunch.
+  if pgrep -f 'frida -U -[fn] ' >/dev/null 2>&1 || lsof -nP -iTCP:"$MP_PROXY_PORT" -sTCP:LISTEN >/dev/null 2>&1; then
+    c_warn "  old app is still hooked/capturing - run 'mp switch $1' to change for real"
+  fi
+}
+
+cmd_scope() {
+  if [ $# -eq 0 ]; then echo "${SCOPE:-(all hosts)}"; else SCOPE="$1"; save_conf; c_ok "scope = $SCOPE"; fi
+}
+
+cmd_launch() {
+  local pkg="${1:-$TARGET}"
+  [ -z "$pkg" ] && need_target
+  "$SCRIPTS/launch.sh" "$pkg" "${@:2}"
+}
+
+# Does this argument look like something to INSTALL, rather than an already-
+# installed package name? .apk/.xapk/.apkm/.apks files, http(s) urls, Play
+# Store / market links, or an existing local path.
+is_install_source() {
+  case "$1" in
+    *.apk|*.xapk|*.apkm|*.apks) return 0 ;;
+    http*://*|market:*|id=*) return 0 ;;
+    *) [ -e "$1" ] ;;
+  esac
+}
+
+# THE single entry point for starting a new scan session. One command, one
+# clear numbered readout, works no matter where you're starting from:
+#   mp scan                    no target chosen -> opens the app picker
+#   mp scan <pkg>               already-installed app, by exact or fuzzy name
+#   mp scan <apk|url|play-link> installs it first, then proceeds identically
+#
+# Always rolls a FRESH session and force-stops whatever was hooked before -
+# "start a new scan" should never mean "silently attach to an old capture".
+cmd_scan() {
+  local src="${1:-}"
+  echo
+  c_dim "NEW SCAN"
+
+  echo "[1/4] environment"
+  cmd_up --brief || exit 1
+  c_ok "      emulator up, frida-server running, CA installed"
+
+  echo "[2/4] target"
+  local pkg=""
+  if [ -z "$src" ]; then
+    if [ -n "$TARGET" ]; then
+      pkg="$TARGET"
+    else
+      echo "      no target chosen -"
+      cmd_apps || exit 1
+      . "$CONF"; pkg="$TARGET"
+    fi
+  elif is_install_source "$src"; then
+    "$SCRIPTS/install-app.sh" "$src" --no-scan || exit 1
+    . "$CONF"; pkg="$TARGET"
+  else
+    local exact; exact=$(A shell "pm list packages $src" 2>/dev/null | tr -d '\r' | grep -x "package:$src")
+    if [ -n "$exact" ]; then
+      pkg="$src"
+    else
+      local matches count
+      matches=$(A shell "pm list packages -3" 2>/dev/null | tr -d '\r' | sed 's/^package://' | grep -i -- "$src")
+      count=$(printf '%s\n' "$matches" | grep -c .)
+      if [ "$count" -eq 1 ]; then
+        pkg="$matches"
+      elif [ "$count" -gt 1 ]; then
+        c_err "\"$src\" matches more than one installed app:"
+        printf '%s\n' "$matches" | sed 's/^/        /'
+        echo "      be specific, or run: mp scan   (opens the picker)"
+        exit 1
+      else
+        c_err "\"$src\" isn't installed and isn't a recognised install source"
+        echo "      (.apk / .xapk / .apkm / .apks file, http(s) url, or a Play Store link)"
+        exit 1
+      fi
+    fi
+  fi
+  [ -z "$pkg" ] && { c_err "no target resolved"; exit 1; }
+  c_ok "      $pkg"
+
+  # Always start clean: stop the old hooks/capture, force-stop the outgoing
+  # app so it can't pollute the new session with background traffic.
+  local prev_target="$TARGET"
+  TARGET="$pkg"
+  # A scope set for a DIFFERENT app's hosts silently filters out every request
+  # the new target makes - the flows still land in flows.mitm, but the
+  # analysis feed (flows.jsonl/index.md/surface.md) shows nothing, which looks
+  # exactly like "it's still capturing the old app". Different app -> different
+  # hosts, so the old scope almost never applies; clear it automatically.
+  if [ "$prev_target" != "$pkg" ] && [ -n "$SCOPE" ]; then
+    c_warn "      target changed ($prev_target -> $pkg) - clearing capture scope (was: $SCOPE)"
+    SCOPE=""
+  fi
+  save_conf
+  local prev; prev=$(cat "$MP_ROOT/.active-app" 2>/dev/null)
+  cmd_stop >/dev/null 2>&1
+  pkill -f "mitmweb -r" 2>/dev/null
+  [ -n "$prev" ] && [ "$prev" != "$pkg" ] && A shell "am force-stop $prev" >/dev/null 2>&1
+  sleep 1
+
+  echo "[3/4] capture"
+  if [ -z "$SCOPE" ]; then
+    c_warn "      no scope set -> capturing ALL hosts on the device"
+    c_dim  "      narrow anytime with: mp scope <host>"
+  else
+    c_dim "      scope: $SCOPE"
+  fi
+  local ts sess; ts=$(date +%Y%m%d-%H%M%S); sess="$MP_LOOT/session-$ts"; mkdir -p "$sess"
+  local feed=( -s "$SCRIPTS/mpfeed.py" --set feedout="$sess" )
+  [ -n "$SCOPE" ] && feed+=( --set feedscope="$SCOPE" )
+  nohup mitmdump --listen-host 0.0.0.0 --listen-port "$MP_PROXY_PORT" \
+    -w "$sess/flows.mitm" "${feed[@]}" > "$sess/mitm.log" 2>&1 &
+  echo "$!" > "$MP_ROOT/.capture.pid"
+  sleep 4
+  c_ok "      session -> $(basename "$sess")"
+
+  echo "[4/4] app"
+  "$SCRIPTS/launch.sh" "$pkg" 2>&1 \
+    | grep -E "running with|root checks|SSL unpinning|proxy override" | sed 's/^/      /'
+
+  echo
+  c_ok "Ready — traffic is live. Use the app now."
+  echo "  mp req -f              follow requests as they arrive"
+  echo "  mp brief                ranked findings once you're done"
+  echo "  mp engage $pkg --auto   Claude reviews the traffic for you"
+}
+
+cmd_capture() {
+  MP_SCOPE="$SCOPE" "$SCRIPTS/capture.sh" "${1:-dump}" "${@:2}"
+}
+
+# Launch the app hooked AND start capture in one step - the usual way to begin.
+# Switch the whole lab to a different app in one step: stop the old hooks and
+# capture, set the new target, then go. Prevents the classic confusion where you
+# change the target but the old capture (or a stale mitmweb replay) keeps showing
+# the previous app.
+cmd_switch() {
+  local pkg="${1:-}"
+  [ -z "$pkg" ] && { c_err "usage: mp switch <package>   (see: mp apps)"; exit 1; }
+  echo "[*] switching target -> $pkg"
+  # Force-stop the OUTGOING app now, before cmd_stop wipes .active-app - a
+  # backgrounded old app keeps phoning home and pollutes the new session.
+  local prev; prev=$(cat "$MP_ROOT/.active-app" 2>/dev/null)
+  [ -z "$prev" ] && prev="$TARGET"
+  if [ -n "$prev" ] && [ "$prev" != "$pkg" ]; then
+    echo "[*] stopping previously hooked app: $prev"
+    A shell "am force-stop $prev" >/dev/null 2>&1
+  fi
+  cmd_stop >/dev/null 2>&1
+  pkill -f "mitmweb -r" 2>/dev/null   # kill any static replay masquerading as live
+  # A scope left over from the OLD target's hosts silently filters the new
+  # app's traffic out of the analysis feed entirely (flows.mitm still has it,
+  # but flows.jsonl/index.md/surface.md show nothing) - looks exactly like
+  # capture is stuck on the old app. Different app -> different hosts almost
+  # always, so clear it on an actual target change.
+  if [ "$TARGET" != "$pkg" ] && [ -n "$SCOPE" ]; then
+    c_warn "[*] target changed ($TARGET -> $pkg) - clearing capture scope (was: $SCOPE)"
+    SCOPE=""
+  fi
+  TARGET="$pkg"; save_conf
+  sleep 2
+  cmd_go
+}
+
+cmd_go() {
+  need_target
+  cmd_up --brief || exit 1
+  local sess ts
+  if lsof -nP -iTCP:"$MP_PROXY_PORT" -sTCP:LISTEN >/dev/null 2>&1; then
+    sess=$(active_session)
+    c_warn "capture already running - reusing ${sess:+$(basename "$sess")}"
+    [ -n "$sess" ] && c_dim "  traffic -> $sess"
+  else
+    ts=$(date +%Y%m%d-%H%M%S); sess="$MP_LOOT/session-$ts"; mkdir -p "$sess"
+    local feed=( -s "$SCRIPTS/mpfeed.py" --set feedout="$sess" )
+    [ -n "$SCOPE" ] && feed+=( --set feedscope="$SCOPE" )
+    nohup mitmdump --listen-host 0.0.0.0 --listen-port "$MP_PROXY_PORT" \
+      -w "$sess/flows.mitm" "${feed[@]}" > "$sess/mitm.log" 2>&1 &
+    echo "$!" > "$MP_ROOT/.capture.pid"
+    sleep 4
+    c_ok "capture -> $sess"
+    [ -n "$SCOPE" ] && c_dim "  scope: $SCOPE" || c_dim "  scope: all hosts"
+  fi
+  "$SCRIPTS/launch.sh" "$TARGET"
+  echo
+  c_dim "when finished:  mp analyze     (then read index.md / surface.md / FINDINGS)"
+}
+
+cmd_req() {
+  local sess follow=0 n=25
+  [ "${1:-}" = "-f" ] && { follow=1; shift; }
+  [ -n "${1:-}" ] && n="$1"
+  sess=$(active_session) || { c_err "no capture session with traffic yet"; exit 1; }
+  c_dim "session: $sess"
+  if [ -n "${MP_REQ_APP:-}" ]; then
+    c_dim "app filter: $MP_REQ_APP"
+    python3 -c '
+import json,sys
+app=sys.argv[2]
+for l in open(sys.argv[1]):
+    try: r=json.loads(l)
+    except Exception: continue
+    if (r.get("app") or "")==app:
+        print(f"{r[\"i\"]:4}  {r[\"status\"]}  {r[\"method\"]:6} {r[\"host\"]}{r[\"path\"]}")
+' "$sess/flows.jsonl" "$MP_REQ_APP"
+    return 0
+  fi
+  if [ "$follow" = 1 ]; then
+    tail -f "$sess/index.md"
+  else
+    [ -f "$sess/index.md" ] && tail -n "$n" "$sess/index.md" || c_warn "no requests captured yet"
+  fi
+}
+
+# Which apps appear in this session, with a flow count each.
+apps_in_session() {
+  local sess="$1"
+  [ -s "$sess/flows.jsonl" ] || return 1
+  python3 -c '
+import json,sys,collections
+c=collections.Counter()
+for l in open(sys.argv[1]):
+    try: r=json.loads(l)
+    except Exception: continue
+    c[r.get("app") or "(background/untagged)"]+=1
+for a,n in c.most_common(): print(f"{n}\t{a}")
+' "$sess/flows.jsonl"
+}
+
+# Build a mitmweb view filter for one app's hosts.
+# mitmproxy treats ( ) | as filter-language operators, so a regex alternation
+# like "~d (a|b)" is a syntax error. Emit "~d a | ~d b" with dots escaped.
+filter_for_app() {
+  local sess="$1" app="$2"
+  python3 -c '
+import json,sys,re
+app=sys.argv[2]; hosts=set()
+for l in open(sys.argv[1]):
+    try: r=json.loads(l)
+    except Exception: continue
+    if app=="*" or (r.get("app") or "")==app: hosts.add(r["host"])
+print(" | ".join("~d " + re.escape(h) for h in sorted(hosts)))
+' "$sess/flows.jsonl" "$app"
+}
+
+cmd_web() {
+  local sess app filt
+  sess=$(active_session) || { c_err "no session yet"; exit 1; }
+  [ -f "$sess/flows.mitm" ] || { c_err "no flows.mitm in $sess"; exit 1; }
+
+  app="${1:-}"
+  if [ -z "$app" ]; then
+    local list; list=$(apps_in_session "$sess")
+    if [ -z "$list" ]; then
+      c_warn "no attributed traffic yet - opening everything"
+      app="*"
+    elif command -v fzf >/dev/null 2>&1; then
+      app=$(printf "%s\n%s" "$(echo "$list" | awk -F'\t' '{printf "%s  (%s flows)\n", $2, $1}')" "* all traffic" \
+            | fzf --height=40% --reverse --prompt="inspect app > " --header="which app's traffic?" \
+            | sed 's/  (.*//; s/^\* all traffic$/*/')
+    else
+      echo "Apps in this session:"; echo "$list" | awk -F'\t' '{printf "  %s  (%s flows)\n", $2, $1}'
+      printf "package (blank = all): "; read -r app; [ -z "$app" ] && app="*"
+    fi
+  fi
+  [ -z "$app" ] && { c_dim "cancelled"; exit 0; }
+
+  if [ "$app" != "*" ]; then
+    filt=$(filter_for_app "$sess" "$app")
+  fi
+  c_dim "session: $sess"
+  [ -n "${filt:-}" ] && c_dim "filter : $filt  (app: $app)" || c_dim "filter : none (all traffic)"
+  c_dim "opening http://127.0.0.1:8081"
+  if [ -n "${filt:-}" ]; then
+    mitmweb -r "$sess/flows.mitm" --no-server --web-port 8081 --set view_filter="$filt"
+  else
+    mitmweb -r "$sess/flows.mitm" --no-server --web-port 8081
+  fi
+}
+
+cmd_apps_seen() {
+  local sess; sess=$(active_session) || { c_err "no session yet"; exit 1; }
+  c_dim "session: $sess"
+  apps_in_session "$sess" | awk -F'\t' '{printf "  %-40s %s flows\n", $2, $1}' || c_warn "no traffic yet"
+}
+
+cmd_stop() {
+  "$SCRIPTS/launch.sh" --stop >/dev/null 2>&1
+  [ -f "$MP_ROOT/.capture.pid" ] && kill "$(cat "$MP_ROOT/.capture.pid")" 2>/dev/null
+  rm -f "$MP_ROOT/.capture.pid"
+  pkill -f "mitmdump --listen-host" 2>/dev/null
+  pkill -f "mitmweb --listen-host" 2>/dev/null
+  c_ok "hooks + capture stopped"
+}
+
+cmd_analyze() {
+  local sess="${1:-$(ls -td "$MP_LOOT"/session-* 2>/dev/null | head -1)}"
+  [ -z "$sess" ] && { c_err "no sessions found"; exit 1; }
+  [ -d "$sess" ] || sess="$MP_LOOT/$sess"
+  if [ -f "$sess/flows.mitm" ]; then
+    "$SCRIPTS/analyze.sh" "$sess/flows.mitm" "$SCOPE" "$sess/analysis"
+    c_ok "-> $sess/analysis"
+    ls "$sess/analysis" 2>/dev/null | sed 's/^/    /'
+  else
+    c_err "no flows.mitm in $sess"; exit 1
+  fi
+}
+
+cmd_sessions() {
+  local n=0
+  for d in $(ls -td "$MP_LOOT"/session-* 2>/dev/null); do
+    local f; f=$(wc -l < "$d/flows.jsonl" 2>/dev/null || echo 0)
+    printf "  %-28s %5s flows  %s\n" "$(basename "$d")" "$f" "$(du -sh "$d" 2>/dev/null | cut -f1)"
+    n=$((n+1)); [ $n -ge 15 ] && break
+  done
+  [ $n -eq 0 ] && c_dim "  no sessions yet"
+  return 0
+}
+
+cmd_install() { "$SCRIPTS/install-app.sh" "$@"; }
+
+cmd_engage() {
+  if [ "${1:-}" = "--stop" ]; then
+    local n=0
+    for f in "$MP_ROOT"/engagements/*/.agent.pid; do
+      [ -f "$f" ] || continue
+      kill "$(cat "$f")" 2>/dev/null && n=$((n+1)); rm -f "$f"
+    done
+    pkill -f "claude -p" 2>/dev/null
+    c_ok "stopped $n engagement agent(s)"; return 0
+  fi
+  "$SCRIPTS/engage.sh" "$@"
+}
+
+cmd_brief() {
+  local sess="${1:-$(active_session)}"
+  [ -n "$sess" ] || { c_err "no session with traffic"; exit 1; }
+  [ -d "$sess" ] || sess="$MP_LOOT/$sess"
+  python3 "$SCRIPTS/brief.py" "$sess"
+}
+
+cmd_pull()  { "$SCRIPTS/pull-apk.sh" "${1:-$TARGET}"; }
+cmd_static()  {
+  local apk="${1:-}"
+  [ -z "$apk" ] && { need_target; apk="$MP_APKS/$TARGET/base.apk"; }
+  [ -f "$apk" ] || { c_err "no APK at $apk - run 'mp pull' first"; exit 1; }
+  "$SCRIPTS/static-scan.sh" "$apk"
+}
+cmd_log()   { "$SCRIPTS/launch.sh" --log; }
+cmd_mobsf() { "$SCRIPTS/mobsf.sh" "${1:-start}"; }
+cmd_ca()    { "$SCRIPTS/install-ca.sh" "$@"; }
+cmd_burp()  { "$SCRIPTS/use-burp.sh" "$@"; }
+cmd_doctor() { "$SCRIPTS/selftest.sh" "$@"; }
+
+# Bring MuMu to the front and show what's stored for this target - the
+# terminal-side half of "log in manually": MuMu is already a normal window
+# you can click into, this just surfaces what to type and brings it forward.
+cmd_login() {
+  local pkg="${1:-$TARGET}"
+  [ -z "$pkg" ] && need_target
+  python3 "$SCRIPTS/creds.py" front
+  python3 "$SCRIPTS/creds.py" show "$pkg" "${@:2}"
+}
+cmd_creds() { python3 "$SCRIPTS/creds.py" "$@"; }
+cmd_shell() { A shell "$@"; }
+cmd_obj()   { need_target; objection -g "${1:-$TARGET}" explore; }
+cmd_logcat(){
+  local pkg="${1:-$TARGET}"
+  if [ -n "$pkg" ]; then
+    local pid; pid=$(A shell "pidof $pkg" | tr -d '\r')
+    [ -n "$pid" ] && exec adb -s "$MP_DEVICE" logcat --pid="$pid" || { c_warn "$pkg not running - showing all"; exec adb -s "$MP_DEVICE" logcat; }
+  fi
+  exec adb -s "$MP_DEVICE" logcat
+}
+cmd_down()  { cmd_stop; A shell "settings delete global http_proxy" >/dev/null 2>&1; c_ok "proxy off"; }
+
+cmd_help() {
+cat <<EOF
+mp - MuMu Android pentest lab
+
+ START A SCAN  <- this is the one command you need
+  mp scan                     nothing chosen yet -> opens the app picker
+  mp scan <pkg>                an already-installed app, by name (fuzzy OK)
+  mp scan <apk|url|play-link>  installs it, then scans it - same result
+
+  Always: brings the environment up, resolves the target, force-stops
+  whatever was hooked before, starts a FRESH capture session, and
+  launches the app with root/SSL bypasses active. One numbered readout,
+  every time. Apps with root detection MUST be started this way - opening
+  them from the launcher icon starts them unhooked.
+
+ WHILE IT'S RUNNING
+  mp req [-f|N]          show captured HTTP requests (-f to follow live)
+  mp web [pkg]            mitmweb UI, filtered to one app
+  mp scope  [host]        narrow capture+analysis to a host substring
+  mp seen                 which apps produced traffic in this session
+  mp status                what's running right now
+  mp stop                  stop hooks and capture
+
+ ANALYSE
+  mp brief [session]      ranked pentest brief + replay harness  <- start here
+  mp engage [pkg]          full Claude Code session in a target folder
+  mp engage [pkg] --auto   headless agent that reviews the live traffic
+  mp engage --stop         stop running engagement agents
+  mp analyze [session]     full feed (index/surface/flags) + brief
+  mp sessions              list capture sessions
+  mp static [apk]          static analysis only (apktool + jadx + apkleaks)
+  mp mobsf  [start]        MobSF at http://127.0.0.1:8010
+
+ DASHBOARD & SETUP
+  mp dash [port]         WEB DASHBOARD - everything in one page (:8090)
+  mp up                   bring the environment up without launching an app
+  mp auto mobsf-on        also start MobSF with 'mp up'
+  mp down                 stop everything, remove device proxy
+  mp doctor [--quick]     verify every dependency actually works, not just present
+  scripts/install.sh      (re-)install all host dependencies
+
+ BUILDING BLOCKS  (mp scan is built from these - use directly for scripting
+                    or finer control; you don't need them for normal use)
+  mp apps [filter]        app picker (fzf), sets the target
+  mp target [pkg]          show/set the target without touching capture
+  mp install <src> [--passive|--no-scan]   install only, no live capture
+  mp switch <pkg>          same as scan, but for an app you know is installed
+  mp go                    launch hooked + capture, REUSING a live capture
+  mp launch [pkg]           launch hooked only (detached, root+SSL bypass)
+  mp capture [mode]        start capture only (dump|web|proxy|wg)
+  mp pull   [pkg]           pull the APK
+
+ LOGIN  (MuMu is already a normal window - click into it and type. This is
+         just a place to keep test-account creds and push them in for you.)
+  mp login [pkg]          bring MuMu forward, show stored creds (masked)
+  mp login [pkg] --reveal   same, unmasked
+  mp creds set <pkg> <label> <value> [--type text|password|totp]
+  mp creds rm  <pkg> <label>
+  mp creds type <pkg> <label>   tap the field on-screen FIRST, then this
+                                sends that value (or live TOTP code) to it
+
+ MISC
+  mp obj    [pkg]        objection explore
+  mp logcat [pkg]         logcat filtered to the app
+  mp shell  [cmd]         adb shell
+  mp ca <cert>            install a CA into the system store
+  mp burp [port]          hand traffic to Burp (installs its CA, repoints device)
+  mp burp --mitm          switch back to mitmproxy
+EOF
+}
+
+case "${1:-status}" in
+  scan)      shift; cmd_scan "$@" ;;
+  up)        shift; cmd_up "$@" ;;
+  status|st) cmd_status ;;
+  apps)      shift; cmd_apps "$@" ;;
+  target)    shift; cmd_target "$@" ;;
+  auto)      shift; cmd_auto "$@" ;;
+  dash|dashboard) shift; cmd_dash "$@" ;;
+  scope)     shift; cmd_scope "$@" ;;
+  go)        cmd_go ;;
+  switch|sw) shift; cmd_switch "$@" ;;
+  launch|l)  shift; cmd_launch "$@" ;;
+  capture)   shift; cmd_capture "$@" ;;
+  req|requests) shift; cmd_req "$@" ;;
+  brief)     shift; cmd_brief "$@" ;;
+  install)   shift; cmd_install "$@" ;;
+  engage)    shift; cmd_engage "$@" ;;
+  web)       shift; cmd_web "$@" ;;
+  seen)      cmd_apps_seen ;;
+  stop)      cmd_stop ;;
+  down)      cmd_down ;;
+  analyze|analyse) shift; cmd_analyze "$@" ;;
+  sessions)  cmd_sessions ;;
+  pull)      shift; cmd_pull "$@" ;;
+  static)    shift; cmd_static "$@" ;;
+  log)       cmd_log ;;
+  mobsf)     shift; cmd_mobsf "$@" ;;
+  obj|objection) shift; cmd_obj "$@" ;;
+  logcat)    shift; cmd_logcat "$@" ;;
+  shell)     shift; cmd_shell "$@" ;;
+  ca)        shift; cmd_ca "$@" ;;
+  burp)      shift; cmd_burp "$@" ;;
+  doctor)    shift; cmd_doctor "$@" ;;
+  login)     shift; cmd_login "$@" ;;
+  creds)     shift; cmd_creds "$@" ;;
+  help|-h|--help) cmd_help ;;
+  *) c_err "unknown command: $1"; echo; cmd_help; exit 1 ;;
+esac

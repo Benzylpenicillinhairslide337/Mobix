@@ -1,0 +1,1720 @@
+#!/usr/bin/env python3
+"""
+Web dashboard for the MuMu pentest lab.
+
+One page fronting every service: device/emulator state, frida-server, proxy, CA,
+the hooked app, live captured requests, and links into mitmweb / MobSF.
+
+Bound to 127.0.0.1 only. It shells out to `mp`, so it must never be exposed on a
+routable interface — actions are a fixed whitelist and arguments are validated,
+but the blast radius of a remote caller would still be the whole toolkit.
+
+  mp dash            start on http://127.0.0.1:8090
+  mp dash --port N   different port
+"""
+from __future__ import annotations
+
+import json
+import os
+import re
+import shutil
+import subprocess
+import sys
+import threading
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from pathlib import Path
+from urllib.parse import parse_qs, urlparse
+import urllib.request
+import urllib.error
+import time
+
+ROOT = Path(os.environ.get("MP_ROOT", Path.home() / "mobile-pentest"))
+MP = str(ROOT / "bin" / "mp")
+SCRIPTS = ROOT / "scripts"
+LOOT = ROOT / "loot"
+APKS = ROOT / "apks"
+
+PKG_RE = re.compile(r"^[A-Za-z0-9_.]{1,128}$")
+HOST_RE = re.compile(r"^[A-Za-z0-9_.,:-]{0,200}$")
+ANSI = re.compile(r"\x1b\[[0-9;]*m")
+
+
+def sh(cmd: list[str], timeout: int = 120) -> tuple[int, str]:
+    try:
+        p = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
+        return p.returncode, ANSI.sub("", (p.stdout or "") + (p.stderr or ""))
+    except subprocess.TimeoutExpired:
+        return 124, f"timed out after {timeout}s"
+    except Exception as e:
+        return 1, str(e)
+
+
+def env():
+    """Resolve the device serial the same way the shell scripts do."""
+    rc, out = sh(["bash", "-c", f'. "{SCRIPTS}/env.sh"; echo "$MP_DEVICE"'], 20)
+    return out.strip().splitlines()[-1] if out.strip() else "emulator-5554"
+
+
+def adb(args: list[str], timeout: int = 20) -> str:
+    return sh(["adb", "-s", env(), *args], timeout)[1]
+
+
+def conf() -> dict:
+    d = {}
+    f = ROOT / "config"
+    if f.exists():
+        for line in f.read_text().splitlines():
+            if "=" in line and not line.startswith("#"):
+                k, _, v = line.partition("=")
+                d[k.strip()] = v.strip().strip('"')
+    return d
+
+
+def active_session() -> Path | None:
+    """Where to read traffic from.
+
+    Prefer the session the running proxy is writing to, but only once it has
+    actually captured something - a live session that is still empty (or is
+    scoped so nothing matches) would otherwise hide every earlier session and
+    make analysis fail with "no request #N".
+    """
+    live = None
+    rc, out = sh(["bash", "-c",
+                  "ps -eo args | grep '[m]itmdump' | tr ' ' '\\n' | grep -m1 '^feedout=' | cut -d= -f2-"], 15)
+    p = out.strip().splitlines()
+    if p and p[-1]:
+        live = Path(p[-1])
+        f = live / "flows.jsonl"
+        if f.exists() and f.stat().st_size:
+            return live
+    for d in sorted(LOOT.glob("session-*"), key=lambda x: x.stat().st_mtime, reverse=True):
+        f = d / "flows.jsonl"
+        if f.exists() and f.stat().st_size:
+            return d
+    return live
+
+
+def port_open(port: int) -> bool:
+    import socket
+    with socket.socket() as s:
+        s.settimeout(0.4)
+        return s.connect_ex(("127.0.0.1", port)) == 0
+
+
+def status() -> dict:
+    dev = env()
+    online = "device" in adb(["get-state"], 8)
+    c = conf()
+    st = {
+        "device": dev if online else None,
+        "online": online,
+        "android": adb(["shell", "getprop", "ro.build.version.release"], 8).strip() if online else "",
+        "abi": adb(["shell", "getprop", "ro.product.cpu.abi"], 8).strip() if online else "",
+        "root": online and adb(["shell", "id", "-u"], 8).strip() == "0",
+        "frida": online and bool(adb(["shell", "pgrep", "-f", "frida-server"], 8).strip()),
+        "proxy": adb(["shell", "settings", "get", "global", "http_proxy"], 8).strip() if online else "",
+        "ca": online and "No such" not in adb(["shell", "ls", "/system/etc/security/cacerts/c8750f0d.0"], 8),
+        "target": c.get("TARGET", ""),
+        "scope": c.get("SCOPE", ""),
+        "hooks": sh(["bash", "-c", "pgrep -f 'frida -U -[fn] ' >/dev/null && echo 1 || echo 0"], 10)[1].strip().endswith("1"),
+        "capture": port_open(8080),
+        "mitmweb": port_open(8081),
+        "mobsf": port_open(8010),
+    }
+    s = active_session()
+    st["session"] = s.name if s else None
+    st["flows"] = sum(1 for _ in (s / "flows.jsonl").open()) if s and (s / "flows.jsonl").exists() else 0
+    return st
+
+
+def emulator_apps() -> list[dict]:
+    """Third-party packages installed ON THE EMULATOR (never host/macOS apps)."""
+    out = adb(["shell", "pm", "list", "packages", "-3"], 25)
+    pkgs = sorted(l.replace("package:", "").strip()
+                  for l in out.splitlines() if l.startswith("package:"))
+    running = adb(["shell", "ps", "-A", "-o", "NAME"], 20)
+    return [{"pkg": p, "running": p in running} for p in pkgs if PKG_RE.match(p)]
+
+
+ID_HEX_LENS = (24, 36)
+
+
+def fold_path(path: str) -> str:
+    """/user/6a71b30c8044c1e18603a745 -> /user/{id} - same folding used by
+    brief.py, so the tree and the ranked brief agree on what an "endpoint" is."""
+    out = []
+    for seg in (path or "").split("/"):
+        if seg.isdigit() or (len(seg) in ID_HEX_LENS and all(c in "0123456789abcdef-" for c in seg.lower())):
+            out.append("{id}")
+        else:
+            out.append(seg)
+    return "/".join(out)
+
+
+def build_tree(rows: list[dict]) -> dict:
+    """host -> nested path-segment tree with per-node hit counts. IDs are
+    folded to {id} so /user/111 and /user/222 land on the same branch."""
+    tree: dict = {}
+    for r in rows:
+        host = r.get("host") or "(unknown)"
+        hnode = tree.setdefault(host, {"count": 0, "children": {}})
+        hnode["count"] += 1
+        cur = hnode
+        for seg in [s for s in (r.get("tmpl") or "").split("/") if s]:
+            cur = cur["children"].setdefault(seg, {"count": 0, "children": {}})
+            cur["count"] += 1
+    return tree
+
+
+def recent_requests(limit: int = 2000, app: str = "") -> list[dict]:
+    s = active_session()
+    if not s:
+        return []
+    f = s / "flows.jsonl"
+    if not f.exists():
+        return []
+    rows = []
+    for line in f.open():
+        try:
+            r = json.loads(line)
+        except Exception:
+            continue
+        if app and (r.get("app") or "") != app:
+            continue
+        rows.append({
+            "i": r.get("i"), "method": r.get("method"), "host": r.get("host"),
+            "path": r.get("path"), "tmpl": fold_path(r.get("path") or ""),
+            "status": r.get("status"),
+            "app": r.get("app") or "", "auth": r.get("auth_scheme") or "",
+            "flags": ",".join(r.get("flag_types") or []),
+        })
+    return rows[-limit:][::-1]
+
+
+def flow_detail(i: int) -> dict:
+    """Everything captured for one request, with base64 bodies decoded."""
+    sess = active_session()
+    if not sess:
+        return {}
+    f = sess / "flows.jsonl"
+    if not f.exists():
+        return {}
+    for line in f.open():
+        try:
+            r = json.loads(line)
+        except Exception:
+            continue
+        if r.get("i") != i:
+            continue
+
+        def unpack(txt):
+            """Some APIs wrap the real payload in a base64 field; surface it."""
+            out = []
+            if not txt:
+                return out
+            try:
+                doc = json.loads(txt)
+            except Exception:
+                return out
+            if isinstance(doc, dict):
+                for k in ("requestBody", "responseBody", "data", "payload"):
+                    v = doc.get(k)
+                    if isinstance(v, str) and len(v) > 8:
+                        try:
+                            import base64
+                            dec = base64.b64decode(v, validate=True).decode("utf-8", "replace")
+                            if dec.strip()[:1] in "[{\"":
+                                try:
+                                    dec = json.dumps(json.loads(dec), ensure_ascii=False, indent=2)
+                                except Exception:
+                                    pass
+                                out.append({"field": k, "decoded": dec[:20000]})
+                        except Exception:
+                            pass
+            return out
+
+        def pretty(txt):
+            if not txt:
+                return ""
+            try:
+                return json.dumps(json.loads(txt), ensure_ascii=False, indent=2)
+            except Exception:
+                return txt
+
+        r["req_pretty"] = pretty(r.get("req_body"))
+        r["res_pretty"] = pretty(r.get("res_body"))
+        r["req_decoded"] = unpack(r.get("req_body"))
+        r["res_decoded"] = unpack(r.get("res_body"))
+        return r
+    return {}
+
+
+CLAUDE = shutil.which("claude")
+
+
+def analyze_with_claude(kind: str, index: str) -> tuple[bool, str]:
+    """Send captured traffic to Claude Code headlessly and return its analysis.
+
+    The data is inlined into the prompt so the run is self-contained; the
+    mp-traffic MCP server is the interactive path for a live session.
+    """
+    if not CLAUDE:
+        return False, "claude CLI not found on PATH"
+    sess = active_session()
+    if not sess:
+        return False, "no capture session with traffic"
+
+    if kind == "flow":
+        try:
+            i = int(index)
+        except (TypeError, ValueError):
+            return False, "invalid flow index"
+        d = flow_detail(i)
+        if not d:
+            return False, f"no request #{i}"
+        payload = json.dumps(d, indent=2, ensure_ascii=False)[:60000]
+        prompt = (
+            "You are assisting an authorised mobile application penetration test.\n"
+            "Analyse this single intercepted HTTP request/response.\n\n"
+            "Identify: what the endpoint does; the authentication and authorisation model; "
+            "any sensitive data exposed; concrete vulnerability candidates (broken access "
+            "control, IDOR/BOLA, mass assignment, injection, secrets in transit); and the "
+            "single highest-value next test with the exact modification to make.\n"
+            "Be specific and concise. Do not speculate beyond the evidence.\n\n"
+            f"```json\n{payload}\n```"
+        )
+    else:
+        subprocess.run(["python3", str(SCRIPTS / "brief.py"), str(sess)],
+                       capture_output=True, text=True, timeout=180)
+        bf = sess / "BRIEF.md"
+        if not bf.exists():
+            return False, "could not build the brief"
+        brief = bf.read_text()[:60000]
+        prompt = (
+            "You are assisting an authorised mobile application penetration test.\n"
+            "Below is a ranked brief generated from intercepted traffic.\n\n"
+            "Give: (1) the three highest-value things to test next, each with the specific "
+            "request to send and what result would confirm a finding; (2) anything in the "
+            "traffic that already looks like a defect; (3) what coverage is missing.\n"
+            "Be concrete and brief. Do not invent endpoints that are not listed.\n\n"
+            + brief
+        )
+
+    try:
+        p = subprocess.run([CLAUDE, "-p", prompt], capture_output=True, text=True,
+                           timeout=600, cwd=str(ROOT))
+    except subprocess.TimeoutExpired:
+        return False, "claude timed out after 600s"
+    out = (p.stdout or "").strip() or (p.stderr or "").strip()
+    return (p.returncode == 0 and bool(out)), out or "claude returned nothing"
+
+
+def install_log_path():
+    return LOOT / "install.log"
+
+
+def scan_log_path():
+    return LOOT / "newscan.log"
+
+
+def run_new_scan(source: str, scope: str):
+    """Kick off `mp scan` (optionally preceded by `mp scope`) in the
+    background, streaming combined output to newscan.log for the New Scan
+    modal to poll. This is the dashboard's front door for starting a scan -
+    it drives the exact same `mp scan` used from the CLI, so the two
+    surfaces behave identically rather than duplicating the logic."""
+    log = scan_log_path()
+    log.parent.mkdir(parents=True, exist_ok=True)
+    def go():
+        with open(log, "w") as f:
+            if scope:
+                f.write(f"$ mp scope {scope}\n")
+                f.flush()
+                subprocess.run([MP, "scope", scope], stdout=f, stderr=subprocess.STDOUT)
+            args = [MP, "scan"] + ([source] if source else [])
+            f.write("\n$ mp scan" + (f" {source}" if source else "") + "\n\n")
+            f.flush()
+            try:
+                proc = subprocess.Popen(args, stdout=f, stderr=subprocess.STDOUT)
+                proc.wait()
+                f.write("\n[scan finished]\n" if proc.returncode == 0 else f"\n[scan exited {proc.returncode}]\n")
+            except Exception as e:
+                f.write(f"\n[error] {e}\n")
+    threading.Thread(target=go, daemon=True).start()
+
+
+def run_install(source: str, passive: bool):
+    args = [str(SCRIPTS / "install-app.sh"), source]
+    if passive:
+        args.append("--passive")
+    log = install_log_path()
+    log.parent.mkdir(parents=True, exist_ok=True)
+    def go():
+        with open(log, "w") as f:
+            f.write(f"$ install-app.sh {source}{' --passive' if passive else ''}\n\n")
+            f.flush()
+            try:
+                proc = subprocess.Popen(args, stdout=f, stderr=subprocess.STDOUT)
+                proc.wait()
+                f.write("\n[install finished]\n")
+            except Exception as e:
+                f.write(f"\n[error] {e}\n")
+    threading.Thread(target=go, daemon=True).start()
+
+
+def save_upload(headers, rfile) -> str:
+    """Minimal multipart/form-data parser — saves the first file part.
+
+    cgi is gone in 3.13, so parse by hand: split the body on the boundary and
+    pull the part that carries a filename.
+    """
+    ctype = headers.get("Content-Type", "")
+    if "boundary=" not in ctype:
+        raise ValueError("not multipart")
+    boundary = ("--" + ctype.split("boundary=", 1)[1].strip()).encode()
+    length = int(headers.get("Content-Length") or 0)
+    body = rfile.read(length)
+    for part in body.split(boundary):
+        head, _, data = part.partition(b"\r\n\r\n")
+        if b"filename=" not in head:
+            continue
+        fn = head.split(b"filename=", 1)[1].split(b"\r\n", 1)[0].strip().strip(b'"').decode("utf-8", "replace")
+        fn = os.path.basename(fn) or "upload.apk"
+        if not re.match(r"^[\w.\- ]{1,120}$", fn):
+            fn = "upload.apk"
+        data = data.rsplit(b"\r\n", 1)[0]   # drop trailing CRLF before boundary
+        dest = APKS / "uploads"
+        dest.mkdir(parents=True, exist_ok=True)
+        out = dest / fn
+        out.write_bytes(data)
+        return str(out)
+    raise ValueError("no file part found")
+
+
+def engagement_status() -> dict:
+    base = ROOT / "engagements"
+    engs = sorted(base.glob("*"), key=lambda p: p.stat().st_mtime, reverse=True) if base.exists() else []
+    engs = [e for e in engs if e.is_dir()]
+    if not engs:
+        return {"engagement": None}
+    e = engs[0]
+
+    # Running if the --auto agent pid is alive, OR an interactive claude session
+    # for this engagement is still open (interactive sessions write no pidfile).
+    running = False
+    pidf = e / ".agent.pid"
+    if pidf.exists():
+        try:
+            os.kill(int(pidf.read_text().strip()), 0); running = True
+        except Exception:
+            running = False
+    if not running:
+        try:
+            ps = subprocess.run(["bash", "-c", "ps -eo args"], capture_output=True, text=True).stdout
+            running = ("authorised security review" in ps) or (e.name in ps)
+        except Exception:
+            pass
+
+    def severity(text: str) -> str:
+        m = re.search(r"(?im)^\**\s*severity\**\s*[:=]\s*\**\s*([A-Za-z/ -]+)", text)
+        if m:
+            return m.group(1).strip().split()[0].capitalize()
+        low = text.lower()
+        for sev in ("critical", "high", "medium", "low", "info"):
+            if sev in low:
+                return sev.capitalize()
+        return ""
+
+    findings = []
+    fd = e / "findings"
+    if fd.exists():
+        files = [f for f in fd.glob("*.md") if f.name != "README.md"]
+        files.sort(key=lambda f: f.stat().st_mtime, reverse=True)   # newest first
+        import time as _t
+        now = _t.time()
+        for f in files:
+            try:
+                txt = f.read_text()
+            except Exception:
+                txt = ""
+            title = ""
+            for line in txt.splitlines():
+                if line.startswith("#"):
+                    title = line.lstrip("# ").strip(); break
+            mt = f.stat().st_mtime
+            findings.append({
+                "file": f.name,
+                "title": title or f.stem,
+                "severity": severity(txt),
+                "mtime": int(mt),
+                "age_min": int((now - mt) / 60),
+            })
+
+    tail = ""
+    log = e / "scan.log"
+    if log.exists():
+        try:
+            txt = subprocess.run(["tail", "-c", "4000", str(log)], capture_output=True, text=True).stdout
+            msgs = []
+            for ln in txt.splitlines():
+                try:
+                    ev = json.loads(ln)
+                except Exception:
+                    continue
+                if ev.get("type") == "assistant":
+                    for b in ev.get("message", {}).get("content", []):
+                        if b.get("type") == "text" and b.get("text", "").strip():
+                            msgs.append(b["text"].strip())
+                        elif b.get("type") == "tool_use":
+                            msgs.append("· " + b.get("name", ""))
+            tail = "\n".join(msgs[-8:])
+        except Exception:
+            pass
+
+    return {
+        "engagement": e.name,
+        "running": running,
+        "mode": "auto" if pidf.exists() else "interactive",
+        "findings": findings,
+        "latest": findings[0] if findings else None,
+        "activity": tail,
+    }
+
+
+_SIGNER = None
+_SIGNER_TRIED = False
+
+
+_CREDS_MOD = None
+
+
+def creds_mod():
+    """Lazily load scripts/creds.py - same trick as repeater_signer(), so
+    storage format/TOTP/adb-typing logic has exactly one implementation
+    shared by the CLI (`mp login`/`mp creds`) and this dashboard."""
+    global _CREDS_MOD
+    if _CREDS_MOD is None:
+        import importlib.util
+        path = SCRIPTS / "creds.py"
+        spec = importlib.util.spec_from_file_location("mp_creds", path)
+        mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+        _CREDS_MOD = mod
+    return _CREDS_MOD
+
+
+def repeater_signer():
+    """Lazily load compute_macin() from scripts/zc-macin.py, same trick the
+    generated replay.py harnesses use. Returns None if the script or the
+    'cryptography' package it needs isn't available - callers just skip
+    re-signing in that case rather than failing the whole send."""
+    global _SIGNER, _SIGNER_TRIED
+    if _SIGNER_TRIED:
+        return _SIGNER
+    _SIGNER_TRIED = True
+    try:
+        import importlib.util
+        path = SCRIPTS / "zc-macin.py"
+        if path.exists():
+            spec = importlib.util.spec_from_file_location("zc_macin", path)
+            mod = importlib.util.module_from_spec(spec)
+            spec.loader.exec_module(mod)
+            _SIGNER = mod.compute_macin
+    except Exception:
+        _SIGNER = None
+    return _SIGNER
+
+
+def repeater_send(method: str, url: str, headers: dict, body: str, resign: bool) -> dict:
+    """Actually transmit an (edited) request and return the raw response.
+    Sent directly from this host, not through the emulator - the captured
+    APIs are ordinary internet endpoints, so no device hop is needed."""
+    resigned = False
+    if resign and body:
+        try:
+            doc = json.loads(body)
+            if isinstance(doc, dict) and "macIn" in doc:
+                signer = repeater_signer()
+                if signer:
+                    doc["macIn"] = signer(doc)
+                    body = json.dumps(doc, separators=(",", ":"))
+                    resigned = True
+        except Exception:
+            pass
+
+    data = body.encode("utf-8") if body else None
+    req = urllib.request.Request(url, data=data, headers=headers, method=method)
+    t0 = time.time()
+    try:
+        with urllib.request.urlopen(req, timeout=25) as resp:
+            raw = resp.read(300000)
+            return {"ok": True, "status": resp.status,
+                    "headers": dict(resp.headers.items()),
+                    "body": raw.decode("utf-8", "replace"),
+                    "resigned": resigned, "elapsed_ms": int((time.time() - t0) * 1000)}
+    except urllib.error.HTTPError as e:
+        raw = e.read(300000)
+        return {"ok": True, "status": e.code,
+                "headers": dict(e.headers.items()) if e.headers else {},
+                "body": raw.decode("utf-8", "replace"),
+                "resigned": resigned, "elapsed_ms": int((time.time() - t0) * 1000)}
+    except Exception as e:
+        return {"ok": False, "error": str(e), "resigned": resigned,
+                "elapsed_ms": int((time.time() - t0) * 1000)}
+
+
+def bypass_catalog() -> dict:
+    rc, out = sh(["python3", str(SCRIPTS / "bypass.py"), "--list"], 30)
+    try:
+        return json.loads(out[out.index("{"):])
+    except Exception:
+        return {"scripts": [], "anti": [], "anti_enabled": True}
+
+
+def bypass_set(key: str, on: bool) -> tuple[bool, str]:
+    if not re.match(r"^(anti\.)?[A-Za-z0-9_.-]{1,40}$", key or ""):
+        return False, "invalid module key"
+    rc, out = sh(["python3", str(SCRIPTS / "bypass.py"),
+                  "--set", f"{key}={'1' if on else '0'}"], 30)
+    return rc == 0, ("" if rc == 0 else out)
+
+
+def apps_in_session() -> list[dict]:
+    s = active_session()
+    if not s or not (s / "flows.jsonl").exists():
+        return []
+    counts: dict[str, int] = {}
+    for line in (s / "flows.jsonl").open():
+        try:
+            r = json.loads(line)
+        except Exception:
+            continue
+        counts[r.get("app") or "(background)"] = counts.get(r.get("app") or "(background)", 0) + 1
+    return [{"app": k, "flows": v} for k, v in sorted(counts.items(), key=lambda kv: -kv[1])]
+
+
+# Whitelisted actions. Nothing here interpolates free-form user input into a shell.
+def run_action(action: str, arg: str) -> tuple[bool, str]:
+    if action in ("up", "down", "stop", "brief", "analyze", "seen", "status"):
+        rc, out = sh([MP, action], 300)
+        return rc == 0, out
+    if action == "go":
+        threading.Thread(target=lambda: sh([MP, "go"], 400), daemon=True).start()
+        return True, "starting: boot emulator if needed, hook target, start capture…"
+    if action == "capture":
+        threading.Thread(target=lambda: sh([MP, "capture", "dump"], 400), daemon=True).start()
+        return True, "capture starting…"
+    if action == "launch":
+        pkg = arg or conf().get("TARGET", "")
+        if not PKG_RE.match(pkg or ""):
+            return False, "invalid package name"
+        threading.Thread(target=lambda: sh([MP, "launch", pkg], 400), daemon=True).start()
+        return True, f"launching {pkg} with bypasses…"
+    if action == "target":
+        if not PKG_RE.match(arg or ""):
+            return False, "invalid package name"
+        rc, out = sh([MP, "target", arg], 30)
+        return rc == 0, out
+    if action == "scope":
+        if not HOST_RE.match(arg or ""):
+            return False, "invalid scope"
+        rc, out = sh([MP, "scope", arg] if arg else [MP, "scope", ""], 30)
+        return rc == 0, out
+    if action == "switch":
+        pkg = arg or conf().get("TARGET", "")
+        if not PKG_RE.match(pkg or ""):
+            return False, "invalid package name"
+        threading.Thread(target=lambda: sh([MP, "switch", pkg], 500), daemon=True).start()
+        return True, f"switching to {pkg}: stopping old capture, starting fresh session, hooking…"
+    if action == "engage_auto":
+        pkg = conf().get("TARGET", "")
+        rc, out = sh([MP, "engage", pkg, "--auto"], 120)
+        return rc == 0, out
+    if action == "engage_open":
+        pkg = conf().get("TARGET", "")
+        rc, out = sh([MP, "engage", pkg], 60)
+        return rc == 0, out
+    if action == "engage_stop":
+        rc, out = sh([MP, "engage", "--stop"], 60)
+        return rc == 0, out
+    if action in ("analyze_session", "analyze_flow"):
+        return analyze_with_claude("flow" if action == "analyze_flow" else "session", arg)
+    if action == "bypass":
+        key, _, val = arg.partition("=")
+        ok, err = bypass_set(key, val not in ("0", "false", ""))
+        return ok, err or f"{key} -> {'on' if val not in ('0','false','') else 'off'} (applies on next launch)"
+    if action == "bypass_reset":
+        rc, out = sh(["python3", str(SCRIPTS / "bypass.py"), "--reset"], 30)
+        return rc == 0, "all bypass modules re-enabled"
+    if action == "mobsf":
+        threading.Thread(target=lambda: sh([MP, "mobsf", "start"], 300), daemon=True).start()
+        return True, "MobSF starting…"
+    if action == "burp_switch":
+        port = arg.strip() or "8080"
+        if not port.isdigit() or not (1 <= int(port) <= 65535):
+            return False, "invalid port"
+        rc, out = sh([MP, "burp", port], 30)
+        return rc == 0, out
+    if action == "burp_mitm":
+        rc, out = sh([MP, "burp", "--mitm"], 30)
+        return rc == 0, out
+    if action == "pull":
+        pkg = arg or conf().get("TARGET", "")
+        if not PKG_RE.match(pkg or ""):
+            return False, "invalid package name"
+        rc, out = sh([MP, "pull", pkg], 600)
+        return rc == 0, out
+    if action == "web":
+        s = active_session()
+        if not s:
+            return False, "no session yet"
+        threading.Thread(target=lambda: sh(
+            ["bash", "-c", f'"{MP}" web {arg or "*"} >/dev/null 2>&1'], 600), daemon=True).start()
+        return True, "mitmweb starting on :8081 — check its console for the token URL"
+    return False, f"unknown action: {action}"
+
+
+PAGE = r"""<!doctype html>
+<meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>mp — mobile pentest lab</title>
+<style>
+:root{--bg:#fbfbfd;--fg:#11131a;--mut:#5d6470;--line:#e3e6ec;--card:#fff;--ok:#0f7b40;--warn:#9a6400;--bad:#b3261e;--accent:#4338ca;--sel:#eef0ff}
+@media(prefers-color-scheme:dark){:root{--bg:#0e1015;--fg:#e8eaf0;--mut:#98a0ad;--line:#252a34;--card:#161a21;--ok:#4ade80;--warn:#fbbf24;--bad:#f87171;--accent:#a5b4fc;--sel:#1e2436}}
+:root[data-theme=dark]{--bg:#0e1015;--fg:#e8eaf0;--mut:#98a0ad;--line:#252a34;--card:#161a21;--ok:#4ade80;--warn:#fbbf24;--bad:#f87171;--accent:#a5b4fc;--sel:#1e2436}
+:root[data-theme=light]{--bg:#fbfbfd;--fg:#11131a;--mut:#5d6470;--line:#e3e6ec;--card:#fff;--ok:#0f7b40;--warn:#9a6400;--bad:#b3261e;--accent:#4338ca;--sel:#eef0ff}
+*{box-sizing:border-box}
+html,body{height:100%}
+body{margin:0;background:var(--bg);color:var(--fg);font:13px/1.5 ui-sans-serif,-apple-system,"Segoe UI",Roboto,sans-serif;display:flex;flex-direction:column;overflow:hidden}
+header{display:flex;align-items:center;gap:10px;padding:8px 14px;border-bottom:1px solid var(--line);flex-wrap:wrap;flex:0 0 auto}
+h1{font-size:14px;margin:0}h1 span{color:var(--mut);font-weight:400}
+nav{display:flex;gap:2px;padding:0 14px;border-bottom:1px solid var(--line);flex:0 0 auto}
+nav button{border:0;border-bottom:2px solid transparent;background:none;color:var(--mut);padding:8px 14px;cursor:pointer;font:inherit;border-radius:0}
+nav button.on{color:var(--fg);border-bottom-color:var(--accent)}
+main{flex:1;min-height:0;overflow:hidden}
+.tab{display:none;height:100%;min-height:0}
+.tab.on{display:flex;flex-direction:column}
+.bar{display:flex;gap:8px;padding:8px 14px;border-bottom:1px solid var(--line);align-items:center;flex-wrap:wrap;flex:0 0 auto}
+button{font:inherit;padding:5px 11px;border-radius:7px;border:1px solid var(--line);background:var(--card);color:var(--fg);cursor:pointer}
+button:hover{border-color:var(--accent);color:var(--accent)}
+button.primary{background:var(--accent);color:#fff;border-color:var(--accent)}
+button.primary:hover{color:#fff;opacity:.9}
+input,select{font:inherit;padding:5px 9px;border-radius:7px;border:1px solid var(--line);background:var(--bg);color:var(--fg)}
+.pill{display:inline-block;padding:1px 8px;border-radius:99px;font-size:12px;border:1px solid var(--line)}
+.dot{width:8px;height:8px;border-radius:50%;display:inline-block;margin-right:5px}
+.ok{color:var(--ok)}.warn{color:var(--warn)}.bad{color:var(--bad)}
+/* master-detail with a draggable splitter */
+.split{display:flex;flex:1;min-height:0}
+.list{overflow:auto;min-width:260px;flex:1}
+.gutter{width:5px;cursor:col-resize;background:var(--line);flex:0 0 auto}
+.gutter:hover{background:var(--accent)}
+.detail{width:46%;min-width:280px;overflow:auto;border-left:1px solid var(--line);padding:12px 14px;flex:0 0 auto}
+table{border-collapse:collapse;width:100%}
+th,td{text-align:left;padding:4px 8px;border-bottom:1px solid var(--line);white-space:nowrap;font-size:12.5px}
+th{position:sticky;top:0;background:var(--bg);color:var(--mut);font-weight:500;font-size:11px;text-transform:uppercase;letter-spacing:.05em;z-index:1}
+tbody tr{cursor:pointer}
+tbody tr:hover{background:var(--sel)}
+tbody tr.sel{background:var(--accent);color:#fff}
+td.p{font-family:ui-monospace,monospace;max-width:340px;overflow:hidden;text-overflow:ellipsis}
+pre{background:var(--bg);border:1px solid var(--line);border-radius:8px;padding:9px;overflow:auto;max-height:340px;font:12px/1.45 ui-monospace,monospace;white-space:pre-wrap;word-break:break-word;margin:6px 0}
+h3{font-size:11px;text-transform:uppercase;letter-spacing:.07em;color:var(--mut);margin:14px 0 2px}
+.grid{display:grid;gap:14px;grid-template-columns:repeat(auto-fit,minmax(310px,1fr));padding:14px;overflow:auto}
+.card{background:var(--card);border:1px solid var(--line);border-radius:11px;padding:13px 15px}
+.card h2{font-size:11px;text-transform:uppercase;letter-spacing:.08em;color:var(--mut);margin:0 0 9px}
+.row{display:flex;justify-content:space-between;gap:10px;padding:4px 0;border-bottom:1px solid var(--line)}
+.row:last-child{border:0}.row b{font-weight:500;color:var(--mut)}
+.row span{text-align:right;overflow:hidden;text-overflow:ellipsis}
+.tog{display:flex;align-items:flex-start;gap:10px;padding:8px 0;border-bottom:1px solid var(--line)}
+.tog:last-child{border:0}
+.tog input{margin-top:3px;width:16px;height:16px;accent-color:var(--accent)}
+.tog div{min-width:0}
+.tog code{font-size:12.5px}
+.tog small{display:block;color:var(--mut);font-size:11.5px}
+.applist{max-height:100%;overflow:auto;display:grid;gap:3px}
+.app{display:flex;justify-content:space-between;gap:8px;padding:5px 8px;border-radius:6px;cursor:pointer;font-family:ui-monospace,monospace;font-size:12px}
+.app:hover{background:var(--sel)}.app.sel{background:var(--accent);color:#fff}
+.app small{opacity:.8;font-family:ui-sans-serif}
+.sev{display:inline-block;padding:0 7px;border-radius:5px;font-size:10.5px;font-weight:600;letter-spacing:.03em;text-transform:uppercase;margin-right:7px;flex:0 0 auto}
+.sev-critical{background:#7f1d1d;color:#fecaca}
+.sev-high{background:#7c2d12;color:#fed7aa}
+.sev-medium{background:#713f12;color:#fde68a}
+.sev-low{background:#1e3a5f;color:#bfdbfe}
+.sev-info{background:#374151;color:#d1d5db}
+.finding-row{display:flex;align-items:center;gap:0;padding:6px 8px;border-radius:7px;cursor:pointer}
+.finding-row:hover{background:var(--sel)}
+.finding-row .ftitle{flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.finding-row .fage{color:var(--mut);font-size:11px;flex:0 0 auto;margin-left:8px}
+.tree{width:230px;flex:0 0 auto;overflow:auto;border-right:1px solid var(--line);padding:6px 4px;font-size:12px}
+.trow{display:flex;align-items:center;gap:4px;padding:3px 6px;border-radius:6px;cursor:pointer;white-space:nowrap}
+.trow:hover{background:var(--sel)}
+.trow.sel{background:var(--accent);color:#fff}
+.trow.thost{font-weight:600}
+.tcaret{width:11px;flex:0 0 auto;color:var(--mut);font-size:10px;text-align:center}
+.trow.sel .tcaret{color:#fff}
+.tname{overflow:hidden;text-overflow:ellipsis;font-family:ui-monospace,monospace}
+.tcount{margin-left:auto;color:var(--mut);font-size:10.5px;flex:0 0 auto;padding-left:6px}
+.trow.sel .tcount{color:#fff;opacity:.85}
+.tchip{display:inline-flex;align-items:center;gap:6px;background:var(--sel);border:1px solid var(--accent);border-radius:99px;padding:2px 10px;font-size:12px;font-family:ui-monospace,monospace}
+.tchip a{color:var(--mut);text-decoration:none}
+.tchip a:hover{color:var(--bad)}
+.rtext{width:100%;font-family:ui-monospace,monospace;font-size:12px;background:var(--bg);color:var(--fg);border:1px solid var(--line);border-radius:8px;padding:8px;resize:vertical}
+.crow{display:grid;grid-template-columns:140px 1fr 100px auto auto;gap:8px;align-items:center;padding:6px 0;border-bottom:1px solid var(--line)}
+.crow input,.crow select{width:100%}
+.ctotp{font-family:ui-monospace,monospace;font-size:16px;letter-spacing:2px}
+.cbar{width:100%;height:3px;background:var(--line);border-radius:2px;overflow:hidden;margin-top:3px}
+.cbar i{display:block;height:100%;background:var(--accent)}
+.cwarn{background:var(--sel);border:1px solid var(--warn);border-radius:8px;padding:10px 12px;font-size:12.5px;color:var(--mut);margin-bottom:14px}
+
+
+.fresh{box-shadow:0 0 0 1px var(--accent) inset}
+.hero{border:1px solid var(--accent);border-radius:10px;padding:12px 14px;margin-bottom:14px;cursor:pointer;background:var(--sel)}
+.hero:hover{border-color:var(--fg)}
+.hero .htitle{font-weight:600;margin-top:4px}
+.navdot{display:inline-block;width:7px;height:7px;border-radius:50%;background:var(--bad);margin-left:6px;position:relative;top:-1px}
+.overlay{position:fixed;inset:0;background:rgba(0,0,0,.55);display:none;align-items:center;justify-content:center;z-index:50}
+.overlay.on{display:flex}
+.modal{background:var(--card);border:1px solid var(--line);border-radius:12px;padding:20px 22px;width:min(560px,92vw);max-height:86vh;overflow:auto}
+.modal h2{margin:0 0 4px;font-size:16px}
+.modal .sub{color:var(--mut);font-size:12.5px;margin:0 0 14px}
+.modal label{display:block;color:var(--mut);font-size:11.5px;margin:12px 0 4px;text-transform:uppercase;letter-spacing:.05em}
+#scanApps{max-height:130px;overflow:auto;display:grid;gap:3px;margin-top:6px}
+#scanLog{margin-top:12px;max-height:200px;min-height:20px}
+
+
+#log{font-family:ui-monospace,monospace;font-size:11.5px;white-space:pre-wrap;max-height:150px;overflow:auto;color:var(--mut);padding:8px 14px;border-top:1px solid var(--line);flex:0 0 auto}
+.muted{color:var(--mut)}
+</style>
+
+<header>
+  <h1>mp <span>· mobile pentest lab</span></h1>
+  <span id="hdr" class="pill">…</span>
+  <span id="tgtpill" class="pill"></span>
+  <div style="flex:1"></div>
+  <button class="primary" onclick="openScan()">+ New Scan</button>
+  <button onclick="act('go')">Go</button>
+  <button onclick="act('up')">Bring up</button>
+  <button onclick="act('stop')">Stop</button>
+  <button onclick="theme()">◐</button>
+</header>
+
+<div id="scanOverlay" class="overlay" onclick="if(event.target===this)closeScan()">
+  <div class="modal">
+    <h2>New scan</h2>
+    <p class="sub">One target, one fresh session. Mirrors <code>mp scan</code> exactly.</p>
+
+    <label>Target</label>
+    <input id="scanSrc" style="width:100%" placeholder="package name · .apk/.xapk path · APK URL · Play Store link · blank = rescan current target">
+    <div id="scanApps"></div>
+
+    <label>Capture scope <span style="text-transform:none;font-weight:400">(optional — blank captures every host)</span></label>
+    <input id="scanScopeIn" style="width:100%" placeholder="e.g. api.target.com">
+
+    <div class="btns" style="margin-top:16px;justify-content:flex-end">
+      <button onclick="closeScan()">Cancel</button>
+      <button id="scanStartBtn" class="primary" onclick="startScan()">Start scan</button>
+    </div>
+    <pre id="scanLog"></pre>
+  </div>
+</div>
+
+<nav>
+  <button data-t="install" onclick="tab('install')">Install</button>
+  <button class="on" data-t="traffic" onclick="tab('traffic')">Traffic</button>
+  <button data-t="repeater" onclick="tab('repeater')">Repeater</button>
+  <button data-t="login" onclick="tab('login')">Login</button>
+  <button data-t="bypass" onclick="tab('bypass')">Bypass</button>
+  <button data-t="apps" onclick="tab('apps')">Apps</button>
+  <button data-t="services" onclick="tab('services')">Services</button>
+  <button data-t="engage" onclick="tab('engage')">Claude Analysis<span id="engnavdot" style="display:none" class="navdot"></span></button>
+</nav>
+
+<main>
+  <!-- INSTALL -->
+  <section id="t-install" class="tab">
+    <div class="grid">
+      <div class="card">
+        <h2>Install an app</h2>
+        <p class="muted" style="margin-top:0">Upload an APK, paste a direct APK link, or a Play Store link. After install it runs static analysis and (unless passive) hooks it with a live capture.</p>
+
+        <h3>Upload APK / bundle</h3>
+        <input type="file" id="apkfile" accept=".apk,.xapk,.apkm,.apks,.zip">
+        <div style="margin-top:8px"><button onclick="uploadInstall()">Upload &amp; install</button></div>
+
+        <h3 style="margin-top:16px">Or a link / path</h3>
+        <input id="apksrc" placeholder="https://…/app.apk  ·  play.google.com/…id=pkg  ·  /path/to/app.apk" style="width:100%">
+        <div style="margin-top:8px" class="btns">
+          <label class="muted"><input type="checkbox" id="apkpassive"> passive only (static, no hooking)</label>
+          <button class="primary" onclick="linkInstall()">Install</button>
+        </div>
+      </div>
+      <div class="card">
+        <h2>Install log</h2>
+        <pre id="installlog" style="max-height:420px">idle</pre>
+      </div>
+    </div>
+  </section>
+
+  <!-- TRAFFIC -->
+  <section id="t-traffic" class="tab on">
+    <div class="bar">
+      <select id="appfilter" onchange="loadReqs()"><option value="">all apps</option></select>
+      <input id="q" placeholder="filter host / path / flag…" oninput="render()" style="flex:1;min-width:160px">
+      <span id="treechip"></span>
+      <label class="muted"><input type="checkbox" id="auto" checked> auto</label>
+      <button onclick="loadReqs()">Refresh</button>
+      <button class="primary" onclick="act('engage_auto').then(function(){tab('engage');pollEng();})">Analyze with Claude</button>
+      <span id="cnt" class="muted"></span>
+    </div>
+    <div class="split">
+      <div class="tree" id="treePane"></div>
+      <div class="list"><table>
+        <thead><tr><th>#</th><th>st</th><th>method</th><th>host</th><th>path</th><th>app</th><th>flags</th></tr></thead>
+        <tbody id="reqs"></tbody></table>
+      </div>
+      <div class="gutter" id="gut"></div>
+      <div class="detail" id="detail"><div class="muted">Select a request to inspect it here — headers, body, decoded payloads and response.</div></div>
+    </div>
+  </section>
+
+  <!-- REPEATER -->
+  <section id="t-repeater" class="tab">
+    <div class="bar">
+      <select id="repMethod" style="width:92px">
+        <option>GET</option><option>POST</option><option>PUT</option><option>PATCH</option><option>DELETE</option><option>HEAD</option><option>OPTIONS</option>
+      </select>
+      <input id="repUrl" placeholder="https://host/path" style="flex:1;min-width:220px">
+      <label class="muted"><input type="checkbox" id="repResign"> re-sign macIn</label>
+      <button onclick="newRepeater()">New</button>
+      <button class="primary" id="repSendBtn" onclick="sendRepeater()">Send</button>
+    </div>
+    <div class="split">
+      <div class="list" style="flex:1;padding:10px 14px;overflow:auto">
+        <h3 style="margin-top:0">Request headers</h3>
+        <textarea id="repHeaders" class="rtext" style="height:150px" placeholder="Header: value (one per line)"></textarea>
+        <h3>Request body</h3>
+        <textarea id="repBody" class="rtext" style="height:210px"></textarea>
+        <h3>History <span class="muted" style="text-transform:none;font-weight:400">this session</span></h3>
+        <div id="repHistory" class="applist" style="max-height:150px"></div>
+      </div>
+      <div class="gutter"></div>
+      <div class="detail" id="repResponse" style="width:46%">
+        <div class="muted">Load a captured request ("Repeat this request" in Traffic) or fill this in and hit Send.</div>
+      </div>
+    </div>
+  </section>
+
+  <!-- LOGIN -->
+  <section id="t-login" class="tab">
+    <div class="bar">
+      <input id="credPkg" placeholder="package name" style="width:280px">
+      <button onclick="loadCreds()">Load</button>
+      <div style="flex:1"></div>
+      <button onclick="bringFront()">Bring MuMu to front</button>
+      <button class="primary" onclick="saveCreds()">Save</button>
+    </div>
+    <div class="grid" style="max-width:900px">
+      <div class="card" style="grid-column:1/-1">
+        <div class="cwarn">Stored locally, unencrypted, at <code>~/mobile-pentest/creds/&lt;pkg&gt;.json</code>
+          (file mode 600). Use test / throwaway accounts only — this is not a vault.
+          MuMu Player Pro is a normal window; click into it and type directly, or tap the
+          field you want filled and use <b>Send</b> below to push a stored value in
+          without risking a typo.</div>
+
+        <h2>Fields <span id="credCount" class="muted" style="text-transform:none;font-weight:400"></span></h2>
+        <div id="credRows"></div>
+        <div class="btns" style="margin-top:10px">
+          <button onclick="addCredRow()">+ Add field</button>
+        </div>
+
+        <h2 style="margin-top:20px">Notes</h2>
+        <textarea id="credNotes" class="rtext" style="height:80px" placeholder="e.g. Login screen: email+password, then OTP sent by SMS to +964…"></textarea>
+      </div>
+    </div>
+  </section>
+
+  <!-- BYPASS -->
+  <section id="t-bypass" class="tab">
+    <div class="bar">
+      <b>Bypass modules</b>
+      <span class="muted">changes apply on the next launch</span>
+      <div style="flex:1"></div>
+      <button onclick="act('bypass_reset').then(loadBypass)">Enable all</button>
+      <button class="primary" onclick="act('launch').then(()=>setTimeout(load,2000))">Relaunch target</button>
+    </div>
+    <div class="grid">
+      <div class="card"><h2>Frida scripts</h2><div id="bscripts"></div></div>
+      <div class="card"><h2>Anti-detection modules</h2><div id="banti"></div>
+        <p class="muted" style="font-size:11.5px;margin:10px 0 0">Client-side checks only. Play Integrity / SafetyNet verified by a backend cannot be bypassed here.</p>
+      </div>
+    </div>
+  </section>
+
+  <!-- APPS -->
+  <section id="t-apps" class="tab">
+    <div class="bar">
+      <input id="appq" placeholder="filter emulator apps…" oninput="drawApps()" style="flex:1;min-width:180px">
+      <span class="muted">installed on the Android device</span>
+      <div style="flex:1"></div>
+      <input id="scopein" placeholder="capture scope, e.g. api.target.com">
+      <button onclick="act('scope',$('scopein').value.trim()).then(load)">Set scope</button>
+      <button onclick="act('pull')">Pull APK</button>
+    </div>
+    <div class="grid"><div class="card"><div id="apps" class="applist"></div></div></div>
+  </section>
+
+  <!-- ENGAGE -->
+  <section id="t-engage" class="tab">
+    <div class="bar">
+      <b>Claude Code engagement</b>
+      <span class="muted">a real session in its own folder, live traffic via MCP, pentest skills active</span>
+      <div style="flex:1"></div>
+      <button onclick="pollEng()">Refresh</button>
+      <button class="primary" onclick="act('engage_auto').then(pollEng)">Start analysis</button>
+      <button onclick="act('engage_open')">Open interactive session</button>
+      <button onclick="act('engage_stop').then(pollEng)">Stop</button>
+    </div>
+    <div class="split">
+      <div class="list" style="padding:12px 14px">
+        <div id="engmeta" class="muted">No engagement yet. "Start analysis" spins up a Claude Code agent that reviews the live capture and writes findings.</div>
+        <div id="enghero"></div>
+        <h3>All findings <span id="engcount" class="muted" style="text-transform:none;font-weight:400"></span></h3>
+        <div id="engfindings"></div>
+      </div>
+      <div class="gutter"></div>
+      <div class="detail" id="engdetail" style="width:52%">
+        <h3>Live activity</h3>
+        <pre id="engactivity" style="max-height:none">&mdash;</pre>
+      </div>
+    </div>
+  </section>
+
+  <!-- SERVICES -->
+  <section id="t-services" class="tab">
+    <div class="grid">
+      <div class="card"><h2>Environment</h2><div id="env"></div></div>
+      <div class="card"><h2>Services</h2><div id="svc"></div>
+        <div style="margin-top:10px;display:flex;gap:8px;flex-wrap:wrap">
+          <button onclick="act('capture')">Start capture</button>
+          <button onclick="act('brief')">Build brief</button>
+          <button onclick="act('mobsf')">Start MobSF</button>
+          <button onclick="window.open('http://127.0.0.1:8010','_blank')">Open MobSF</button>
+          <button onclick="act('web',$('appfilter').value||'*')">mitmweb</button>
+        </div>
+      </div>
+      <div class="card">
+        <h2>Burp Suite</h2>
+        <div id="burpStatus"></div>
+        <p class="muted" style="font-size:11.5px;margin:10px 0">
+          Burp must already be running with its proxy listener bound to
+          <b>All interfaces</b> (Proxy settings → Proxy listeners → Edit →
+          Binding) — it defaults to 127.0.0.1, which the emulator can't reach.
+          Switching installs Burp's CA into the system trust store and updates
+          the Frida-injected cert to match, so pinned/system checks stay happy.
+        </p>
+        <div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap">
+          <label class="muted">port <input id="burpPort" value="8080" style="width:70px"></label>
+          <button class="primary" onclick="switchToBurp()">Switch to Burp</button>
+          <button onclick="switchToMitm()">Switch back to mitmproxy</button>
+          <button onclick="loadBurpStatus()">Refresh</button>
+        </div>
+      </div>
+    </div>
+  </section>
+</main>
+
+<div id="log">ready</div>
+
+<script>
+const $=id=>document.getElementById(id);
+let ROWS=[], APPS=[], SEL='', CUR=null;
+let TREEHOST=null, TREEPATH=[], TREE_OPEN=new Set(), TREE_INIT=false;
+
+function tkey(host,path){ return host+(path.length?'\u0001'+path.join('/'):''); }
+
+function renderTreeChildren(node,host,path,depth){
+  const entries=Object.entries(node.children||{}).sort((a,b)=>b[1].count-a[1].count);
+  return entries.map(function(e){
+    const name=e[0], child=e[1];
+    const newPath=path.concat([name]);
+    const key=tkey(host,newPath);
+    const hasKids=Object.keys(child.children||{}).length>0;
+    const open=TREE_OPEN.has(key);
+    const isSel=TREEHOST===host && TREEPATH.join('/')===newPath.join('/');
+    return '<div class="tnode">'
+      +'<div class="trow'+(isSel?' sel':'')+'" style="padding-left:'+(8+depth*14)+'px" '
+      +'data-host="'+esc(host)+'" data-path="'+esc(encodeURIComponent(JSON.stringify(newPath)))+'" data-key="'+esc(key)+'">'
+      +'<span class="tcaret">'+(hasKids?(open?'▾':'▸'):'·')+'</span>'
+      +'<span class="tname">'+esc(name)+'</span><span class="tcount">'+child.count+'</span></div>'
+      +(hasKids?'<div class="tchildren" style="display:'+(open?'':'none')+'">'+renderTreeChildren(child,host,newPath,depth+1)+'</div>':'')
+      +'</div>';
+  }).join('');
+}
+
+async function loadTree(){
+  const app=$('appfilter').value;
+  const tree=await (await fetch('/api/tree'+(app?'?app='+encodeURIComponent(app):''))).json();
+  const hosts=Object.entries(tree).sort(function(a,b){return b[1].count-a[1].count});
+  if(!TREE_INIT){ hosts.forEach(function(h){TREE_OPEN.add(tkey(h[0],[]))}); TREE_INIT=true; }
+  $('treePane').innerHTML=hosts.map(function(e){
+    const host=e[0], node=e[1];
+    const key=tkey(host,[]);
+    const open=TREE_OPEN.has(key);
+    const isSel=TREEHOST===host && TREEPATH.length===0;
+    return '<div class="tnode">'
+      +'<div class="trow thost'+(isSel?' sel':'')+'" data-host="'+esc(host)+'" data-path="'+esc(encodeURIComponent(JSON.stringify([])))+'" data-key="'+esc(key)+'">'
+      +'<span class="tcaret">'+(open?'▾':'▸')+'</span><span class="tname">'+esc(host)+'</span><span class="tcount">'+node.count+'</span></div>'
+      +'<div class="tchildren" style="display:'+(open?'':'none')+'">'+renderTreeChildren(node,host,[],1)+'</div></div>';
+  }).join('')||'<div class="muted" style="padding:8px">no traffic yet</div>';
+}
+
+document.addEventListener('click', function(e){
+  const row=e.target.closest('.trow');
+  const pane=document.getElementById('treePane');
+  if(!row||!pane||!pane.contains(row)) return;
+  const host=row.dataset.host;
+  const path=JSON.parse(decodeURIComponent(row.dataset.path));
+  const key=row.dataset.key;
+  if(TREE_OPEN.has(key)) TREE_OPEN.delete(key); else TREE_OPEN.add(key);
+  treeFilter(host,path);
+  loadTree();
+});
+
+function treeFilter(host,path){
+  TREEHOST=host; TREEPATH=path;
+  $('treechip').innerHTML=host?('<span class="tchip">'+esc(host)+(path.length?'/'+path.map(esc).join('/'):'')+' <a href="javascript:clearTreeFilter()">✕</a></span>'):'';
+  render();
+}
+function clearTreeFilter(){ TREEHOST=null; TREEPATH=[]; $('treechip').innerHTML=''; render(); loadTree(); }
+
+let REPHIST=[];
+let CREDFIELDS=[], CREDPKG='', CREDTIMER=null;
+
+async function loadCredsForCurrentTarget(){
+  const st=await (await fetch('/api/status')).json();
+  $('credPkg').value=st.target||'';
+  if(st.target) loadCreds();
+}
+async function loadCreds(){
+  const pkg=$('credPkg').value.trim();
+  if(!pkg){ $('credRows').innerHTML='<div class="muted">enter a package name above</div>'; return; }
+  CREDPKG=pkg;
+  const d=await (await fetch('/api/creds?pkg='+encodeURIComponent(pkg))).json();
+  CREDFIELDS=(d.fields||[]).map(function(f){return {label:f.label,value:f.value,type:f.type||'text'}});
+  $('credNotes').value=d.notes||'';
+  renderCredRows();
+}
+function addCredRow(){ CREDFIELDS.push({label:'',value:'',type:'text'}); renderCredRows(); }
+function removeCredRow(i){ CREDFIELDS.splice(i,1); renderCredRows(); }
+function updateCredField(i,key,val){ CREDFIELDS[i][key]=val; if(key==='type') renderCredRows(); }
+
+function renderCredRows(){
+  clearTimeout(CREDTIMER);
+  $('credCount').textContent = CREDFIELDS.length? '('+CREDFIELDS.length+')' : '';
+  if(!CREDFIELDS.length){
+    $('credRows').innerHTML='<div class="muted" style="padding:8px 0">no fields yet — add one below</div>';
+    return;
+  }
+  $('credRows').innerHTML=CREDFIELDS.map(function(f,i){
+    const labelInput='<input value="'+escAttr(f.label)+'" placeholder="label" oninput="updateCredField('+i+',\'label\',this.value)">';
+    const typeSelect='<select onchange="updateCredField('+i+',\'type\',this.value)">'
+      +['text','password','totp'].map(function(t){return '<option value="'+t+'"'+(f.type===t?' selected':'')+'>'+t+'</option>'}).join('')
+      +'</select>';
+    let valueCell;
+    if(f.type==='totp'){
+      valueCell='<div><input value="'+escAttr(f.value)+'" placeholder="base32 secret" oninput="updateCredField('+i+',\'value\',this.value)">'
+        +'<div style="margin-top:4px"><span class="ctotp" id="totpcode_'+i+'">------</span> <span class="muted" id="totprem_'+i+'"></span>'
+        +'<div class="cbar"><i id="totpbar_'+i+'" style="width:0%"></i></div></div></div>';
+    } else if(f.type==='password'){
+      valueCell='<input type="password" value="'+escAttr(f.value)+'" placeholder="value" oninput="updateCredField('+i+',\'value\',this.value)" ondblclick="this.type=this.type===\'password\'?\'text\':\'password\'" title="double-click to reveal">';
+    } else {
+      valueCell='<input value="'+escAttr(f.value)+'" placeholder="value" oninput="updateCredField('+i+',\'value\',this.value)">';
+    }
+    return '<div class="crow">'+labelInput+valueCell+typeSelect
+      +'<button onclick="sendCredField('+i+')">Send</button>'
+      +'<button onclick="removeCredRow('+i+')">✕</button></div>';
+  }).join('');
+  if(CREDFIELDS.some(function(f){return f.type==='totp'})) tickTotp();
+}
+
+async function tickTotp(){
+  for(let i=0;i<CREDFIELDS.length;i++){
+    if(CREDFIELDS[i].type!=='totp' || !CREDFIELDS[i].value) continue;
+    try{
+      const r=await (await fetch('/api/totp?secret='+encodeURIComponent(CREDFIELDS[i].value))).json();
+      const codeEl=document.getElementById('totpcode_'+i), remEl=document.getElementById('totprem_'+i), barEl=document.getElementById('totpbar_'+i);
+      if(codeEl){ codeEl.textContent=r.code||'------'; }
+      if(remEl){ remEl.textContent=(r.remaining||0)+'s'; }
+      if(barEl){ barEl.style.width=Math.round(((r.remaining||0)/30)*100)+'%'; }
+    }catch(e){}
+  }
+  CREDTIMER=setTimeout(tickTotp,1000);
+}
+
+async function sendCredField(i){
+  const f=CREDFIELDS[i];
+  let text=f.value;
+  if(f.type==='totp'){
+    const r=await (await fetch('/api/totp?secret='+encodeURIComponent(f.value))).json();
+    text=r.code||'';
+  }
+  const r=await (await fetch('/api/creds_type',{method:'POST',headers:{'content-type':'application/json'},
+    body:JSON.stringify({text:text})})).json();
+  $('log').textContent=r.ok?('sent "'+esc(f.label)+'" to the focused field'):('send failed: '+esc(r.out||''));
+}
+async function saveCreds(){
+  const pkg=$('credPkg').value.trim();
+  if(!pkg){ alert('enter a package name'); return; }
+  const r=await (await fetch('/api/creds',{method:'POST',headers:{'content-type':'application/json'},
+    body:JSON.stringify({pkg:pkg,fields:CREDFIELDS,notes:$('credNotes').value})})).json();
+  $('log').textContent=r.ok?'credentials saved for '+esc(pkg):('save failed: '+esc(r.out||''));
+}
+async function bringFront(){
+  const r=await (await fetch('/api/emulator_front',{method:'POST'})).json();
+  $('log').textContent=r.out||'';
+}
+function escAttr(s){ return esc(s).replace(/"/g,'&quot;'); }
+
+async function loadBurpStatus(){
+  const port=($('burpPort').value||'8080').trim();
+  try{
+    const r=await (await fetch('/api/burp_status?port='+encodeURIComponent(port))).json();
+    const ownerLabel={mitmproxy:'<span class="ok">mitmproxy</span>',burp:'<span class="ok">Burp</span>',
+      other:'<span class="warn">something else</span>',none:'<span class="muted">nothing</span>'}[r.owner]||r.owner;
+    $('burpStatus').innerHTML='<div class="row"><b>port :'+esc(r.port)+'</b><span>'+ownerLabel+'</span></div>'
+      +'<div class="row"><b>device proxy</b><span>'+esc(r.device_proxy||'—')+'</span></div>';
+  }catch(e){ $('burpStatus').innerHTML='<div class="muted">status unavailable</div>'; }
+}
+async function switchToBurp(){
+  const port=($('burpPort').value||'8080').trim();
+  $('log').textContent='switching to Burp on :'+port+'…';
+  const r=await (await fetch('/api/action',{method:'POST',headers:{'content-type':'application/json'},
+    body:JSON.stringify({action:'burp_switch',arg:port})})).json();
+  $('log').textContent=(r.ok?'':'FAILED\n')+(r.out||'done');
+  loadBurpStatus();
+}
+async function switchToMitm(){
+  $('log').textContent='switching back to mitmproxy…';
+  const r=await (await fetch('/api/action',{method:'POST',headers:{'content-type':'application/json'},
+    body:JSON.stringify({action:'burp_mitm',arg:''})})).json();
+  $('log').textContent=(r.ok?'':'FAILED\n')+(r.out||'done');
+  loadBurpStatus();
+}
+function newRepeater(){
+  $('repMethod').value='GET'; $('repUrl').value=''; $('repHeaders').value=''; $('repBody').value=''; $('repResign').checked=false;
+  $('repResponse').innerHTML='<div class="muted">Blank request — fill this in and hit Send.</div>';
+}
+async function loadRepeaterFromFlow(i){
+  const d=await (await fetch('/api/flow?i='+i)).json();
+  if(!d||!d.i) return;
+  $('repMethod').value=(d.method||'GET').toUpperCase();
+  $('repUrl').value=d.scheme+'://'+d.host+d.path;
+  const hide=['content-length','host'];
+  const hdrLines=Object.entries(d.req_headers||{}).filter(function(kv){return hide.indexOf(kv[0].toLowerCase())===-1})
+    .map(function(kv){return kv[0]+': '+kv[1]}).join('\n');
+  $('repHeaders').value=hdrLines;
+  $('repBody').value=d.req_pretty||d.req_body||'';
+  $('repResign').checked=/"macIn"\s*:/.test($('repBody').value);
+  $('repResponse').innerHTML='<div class="muted">Loaded from request #'+i+'. Edit anything, then hit Send.</div>';
+  tab('repeater');
+}
+async function sendRepeater(){
+  const method=$('repMethod').value, url=$('repUrl').value.trim();
+  if(!url){ alert('enter a URL'); return; }
+  const headers=$('repHeaders').value, body=$('repBody').value, resign=$('repResign').checked;
+  $('repSendBtn').disabled=true;
+  $('repResponse').innerHTML='<div class="muted">sending…</div>';
+  const r=await (await fetch('/api/repeater_send',{method:'POST',headers:{'content-type':'application/json'},
+    body:JSON.stringify({method:method,url:url,headers:headers,body:body,resign:resign})})).json();
+  $('repSendBtn').disabled=false;
+  renderRepResponse(r);
+  REPHIST.unshift({method:method,url:url,headers:headers,body:body,resign:resign,result:r});
+  if(REPHIST.length>25) REPHIST.pop();
+  renderRepHistory();
+}
+function renderRepResponse(r){
+  if(!r||!r.ok){ $('repResponse').innerHTML='<div class="warn">Request failed: '+esc(r&&r.error||'unknown error')+'</div>'; return; }
+  const hdrs=Object.entries(r.headers||{}).map(function(kv){return kv[0]+': '+kv[1]}).join('\n')||'(none)';
+  let pretty=r.body||'';
+  try{ pretty=JSON.stringify(JSON.parse(pretty),null,2); }catch(e){}
+  $('repResponse').innerHTML='<div class="muted">'+r.status+' · '+r.elapsed_ms+'ms'+(r.resigned?' · macIn re-signed':'')+'</div>'
+    +'<h3>Response headers</h3><pre>'+esc(hdrs)+'</pre>'
+    +'<h3>Response body</h3><pre>'+esc(pretty)+'</pre>';
+}
+function renderRepHistory(){
+  $('repHistory').innerHTML=REPHIST.map(function(h,idx){
+    let path=h.url; try{ path=new URL(h.url).pathname; }catch(e){}
+    const st=(h.result&&h.result.ok)?h.result.status:'ERR';
+    return '<div class="app" onclick="loadRepHistory('+idx+')"><span>'+esc(h.method)+' '+esc(path)+'</span><small>'+st+'</small></div>';
+  }).join('')||'<div class="muted">no sends yet</div>';
+}
+function loadRepHistory(idx){
+  const h=REPHIST[idx]; if(!h) return;
+  $('repMethod').value=h.method; $('repUrl').value=h.url; $('repHeaders').value=h.headers; $('repBody').value=h.body; $('repResign').checked=h.resign;
+  renderRepResponse(h.result);
+}
+
+function theme(){const r=document.documentElement;const d=r.dataset.theme||(matchMedia('(prefers-color-scheme:dark)').matches?'dark':'light');r.dataset.theme=d==='dark'?'light':'dark'}
+function tab(n){document.querySelectorAll('.tab').forEach(e=>e.classList.remove('on'));$('t-'+n).classList.add('on');
+  document.querySelectorAll('nav button').forEach(b=>b.classList.toggle('on',b.dataset.t===n));
+  if(n==='bypass')loadBypass(); if(n==='apps')loadApps(); if(n==='engage'){pollEng();var d=$('engnavdot');if(d)d.style.display='none';} if(n==='install')pollInstall(); if(n==='login'&&!CREDPKG)loadCredsForCurrentTarget(); if(n==='services')loadBurpStatus();}
+function dot(v){return `<span class="dot" style="background:${v?'var(--ok)':'var(--bad)'}"></span>`}
+function row(k,v){return `<div class="row"><b>${k}</b><span>${v}</span></div>`}
+function esc(s){return (s==null?'':String(s)).replace(/[&<>]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;'}[c]))}
+
+// draggable splitter
+(function(){let drag=false;const g=$('gut'),d=$('detail');
+ g.addEventListener('mousedown',e=>{drag=true;e.preventDefault()});
+ addEventListener('mouseup',()=>drag=false);
+ addEventListener('mousemove',e=>{if(!drag)return;const w=innerWidth-e.clientX;
+   if(w>280&&w<innerWidth-260)d.style.width=w+'px'})})();
+
+async function load(){
+  const s=await (await fetch('/api/status')).json();
+  $('hdr').innerHTML = s.online?`${dot(true)}${s.device} · Android ${s.android}`:`${dot(false)}emulator offline`;
+  $('tgtpill').innerHTML = s.target?`${dot(s.hooks)}${s.target}${s.scope?' · '+s.scope:''}`:'<span class="warn">no target</span>';
+  $('env').innerHTML = row('device',s.online?s.device:'<span class="bad">offline</span>')+
+    row('root',s.root?'<span class="ok">yes</span>':'<span class="bad">no</span>')+
+    row('frida-server',s.frida?'<span class="ok">running</span>':'<span class="warn">stopped</span>')+
+    row('proxy',s.proxy||'—')+row('system CA',s.ca?'<span class="ok">installed</span>':'<span class="bad">missing</span>');
+  $('svc').innerHTML = row('hooks',s.hooks?'<span class="ok">held</span>':'down')+
+    row('capture :8080',s.capture?'<span class="ok">up</span>':'down')+
+    row('mitmweb :8081',s.mitmweb?'<span class="ok">up</span>':'down')+
+    row('MobSF :8010',s.mobsf?'<span class="ok">up</span>':'down')+
+    row('session',s.session||'—')+row('flows',s.flows);
+  SEL=SEL||s.target;
+}
+
+async function loadReqs(){
+  const app=$('appfilter').value;
+  ROWS = await (await fetch('/api/requests'+(app?'?app='+encodeURIComponent(app):''))).json();
+  const seen = await (await fetch('/api/seen')).json();
+  const cur=$('appfilter').value;
+  $('appfilter').innerHTML='<option value="">all apps</option>'+
+    seen.map(x=>`<option value="${esc(x.app)}" ${x.app===cur?'selected':''}>${esc(x.app)} (${x.flows})</option>`).join('');
+  render();
+  loadTree();
+}
+function render(){
+  const q=($('q').value||'').toLowerCase();
+  const f=ROWS.filter(r=>{
+    if(TREEHOST){
+      if(r.host!==TREEHOST) return false;
+      const prefix=TREEPATH.join('/');
+      const rp=(r.tmpl||'').replace(/^\//,'');
+      if(prefix && rp!==prefix && rp.indexOf(prefix+'/')!==0) return false;
+    }
+    return !q||(r.host+r.path+(r.flags||'')+(r.app||'')).toLowerCase().includes(q);
+  });
+  $('cnt').textContent = f.length? f.length+' shown' : 'no traffic captured yet';
+  $('reqs').innerHTML=f.map(r=>`<tr onclick="show(${r.i},this)" class="${CUR===r.i?'sel':''}">
+    <td>${r.i}</td><td>${r.status??''}</td><td>${esc(r.method)}</td><td>${esc(r.host)}</td>
+    <td class="p" title="${esc(r.path)}">${esc(r.path)}</td>
+    <td>${esc(r.app)||'<span class="muted">—</span>'}</td><td>${esc(r.flags)}</td></tr>`).join('');
+}
+async function show(i,tr){
+  CUR=i; document.querySelectorAll('#reqs tr').forEach(x=>x.classList.remove('sel'));
+  if(tr)tr.classList.add('sel');
+  const d=await (await fetch('/api/flow?i='+i)).json();
+  if(!d||!d.i){$('detail').innerHTML='<div class="muted">not found</div>';return}
+  const hdrs=o=>Object.entries(o||{}).map(([k,v])=>`${esc(k)}: ${esc(v)}`).join('\n')||'(none)';
+  let h=`<div style="font-family:ui-monospace,monospace;font-size:13px;word-break:break-all">
+      <b>${esc(d.method)}</b> ${esc(d.scheme)}://${esc(d.host)}${esc(d.path)}</div>
+    <div class="muted" style="margin-top:4px">${d.status??''} · ${esc(d.res_ct||'')} · req ${d.req_len}b / res ${d.res_len}b
+      ${d.app?' · '+esc(d.app):''}${d.authenticated?' · auth '+esc(d.auth_scheme):' · <span class="warn">unauthenticated</span>'}</div>`;
+  if((d.idor_candidates||[]).length) h+=`<h3>Object references (IDOR candidates)</h3><pre>${esc(d.idor_candidates.join('\n'))}</pre>`;
+  if((d.flag_types||[]).length) h+=`<h3>Flags</h3><pre>${esc(d.flag_types.join(', '))}</pre>`;
+  h+=`<div style="margin-top:8px;display:flex;gap:8px;flex-wrap:wrap">
+      <button class="primary" onclick="analyze('flow',${d.i})">Analyse this request with Claude</button>
+      <button onclick="loadRepeaterFromFlow(${d.i})">Repeat this request</button></div>`;
+  h+=`<h3>Request headers</h3><pre>${esc(hdrs(d.req_headers))}</pre>`;
+  if(d.req_pretty) h+=`<h3>Request body</h3><pre>${esc(d.req_pretty)}</pre>`;
+  (d.req_decoded||[]).forEach(x=>h+=`<h3>Request · ${esc(x.field)} decoded</h3><pre>${esc(x.decoded)}</pre>`);
+  h+=`<h3>Response headers</h3><pre>${esc(hdrs(d.res_headers))}</pre>`;
+  if(d.res_pretty) h+=`<h3>Response body</h3><pre>${esc(d.res_pretty)}</pre>`;
+  (d.res_decoded||[]).forEach(x=>h+=`<h3>Response · ${esc(x.field)} decoded</h3><pre>${esc(x.decoded)}</pre>`);
+  $('detail').innerHTML=h;
+}
+
+async function analyze(kind,i){
+  const box=$('detail');
+  box.innerHTML='<div class="muted">Sending to Claude Code… this can take a minute.</div>';
+  $('log').textContent='analysing…';
+  const r=await (await fetch('/api/action',{method:'POST',headers:{'content-type':'application/json'},
+    body:JSON.stringify({action:kind==='flow'?'analyze_flow':'analyze_session',arg:i?String(i):''})})).json();
+  $('log').textContent=r.ok?'analysis complete':'analysis failed';
+  box.innerHTML=`<h3>Claude analysis ${kind==='flow'?'· request #'+i:'· session'}</h3>
+    <pre style="max-height:none">${esc(r.out||'no output')}</pre>
+    <button onclick="CUR&&show(CUR)">Back to request</button>`;
+}
+
+async function loadBypass(){
+  const b=await (await fetch('/api/bypass')).json();
+  const tog=(k,label,desc,on,dis)=>`<label class="tog">
+      <input type="checkbox" ${on?'checked':''} ${dis?'disabled':''} onchange="act('bypass','${k}='+(this.checked?1:0)).then(loadBypass)">
+      <div><code>${esc(label)}</code><small>${esc(desc)}</small></div></label>`;
+  $('bscripts').innerHTML=b.scripts.map(x=>tog(x.key,x.key,x.desc,x.on,false)).join('');
+  $('banti').innerHTML=(b.anti_enabled?'':'<p class="warn" style="margin:0 0 8px">anti-detection is off — enable it on the left to use these</p>')
+    + b.anti.map(x=>tog('anti.'+x.key,x.key,x.desc,x.on,!b.anti_enabled)).join('');
+}
+
+async function loadApps(){ APPS=await (await fetch('/api/apps')).json(); drawApps(); }
+function drawApps(){
+  const f=($('appq').value||'').toLowerCase();
+  $('apps').innerHTML=APPS.filter(a=>a.pkg.toLowerCase().includes(f)).map(a=>
+    `<div class="app ${a.pkg===SEL?'sel':''}" onclick="pick('${esc(a.pkg)}')">
+      <span>${esc(a.pkg)}</span>${a.running?'<small>running</small>':''}</div>`).join('')||'<div class="muted">no matches</div>';
+}
+async function pick(p){SEL=p;drawApps();
+  if(confirm('Switch capture to '+p+'?\n\nThis stops the current capture, starts a fresh session, and launches '+p+' hooked.')){
+    tab('traffic'); await act('switch',p); setTimeout(()=>{load();loadReqs()},4000);
+  } else { await act('target',p); }  // just set target without switching
+  load();
+}
+
+async function act(a,arg){
+  $('log').textContent=`running ${a}…`;
+  const r=await (await fetch('/api/action',{method:'POST',headers:{'content-type':'application/json'},
+    body:JSON.stringify({action:a,arg:arg||''})})).json();
+  $('log').textContent=(r.ok?'':'FAILED\n')+(r.out||'done');
+  setTimeout(load,1200); return r;
+}
+
+
+
+let SCANTIMER=null, SCANAPPSLOADED=false;
+async function openScan(){
+  $('scanLog').textContent='';
+  $('scanStartBtn').disabled=false;
+  try{ const st=await (await fetch('/api/status')).json(); $('scanScopeIn').value=st.scope||''; $('scanSrc').value=''; }
+  catch(e){}
+  $('scanOverlay').classList.add('on');
+  if(!SCANAPPSLOADED){ SCANAPPSLOADED=true; loadScanApps(); }
+}
+function closeScan(){ $('scanOverlay').classList.remove('on'); clearTimeout(SCANTIMER); }
+async function loadScanApps(){
+  const apps=await (await fetch('/api/apps')).json();
+  $('scanApps').innerHTML=apps.map(function(a){
+    return '<div class="app" onclick="pickScanApp(\''+esc(a.pkg)+'\')"><span>'+esc(a.pkg)+'</span>'
+      +(a.running?'<small>running</small>':'')+'</div>';
+  }).join('')||'<div class="muted">no third-party apps found</div>';
+}
+function pickScanApp(pkg){ $('scanSrc').value=pkg; }
+async function startScan(){
+  const source=$('scanSrc').value.trim(), scope=$('scanScopeIn').value.trim();
+  $('scanStartBtn').disabled=true;
+  $('scanLog').textContent='starting…';
+  await fetch('/api/new_scan',{method:'POST',headers:{'content-type':'application/json'},
+    body:JSON.stringify({source:source,scope:scope})});
+  pollScan();
+}
+async function pollScan(){
+  const r=await (await fetch('/api/scan_status')).json();
+  $('scanLog').textContent=r.log||'starting…';
+  $('scanLog').scrollTop=$('scanLog').scrollHeight;
+  clearTimeout(SCANTIMER);
+  if(r.running){
+    SCANTIMER=setTimeout(pollScan,2000);
+  } else {
+    $('scanStartBtn').disabled=false;
+    if(r.log && r.log.indexOf('Ready')!==-1){
+      setTimeout(function(){ closeScan(); tab('traffic'); load(); loadReqs(); }, 1200);
+    }
+  }
+}
+
+let ENGTIMER=null, LASTSEENFINDING=null, ENGPOLLING=false;
+function sevClass(sev){const k=(sev||'').toLowerCase();return ['critical','high','medium','low','info'].includes(k)?'sev-'+k:'';}
+function ageText(min){if(min<1)return 'just now';if(min<60)return min+'m ago';const h=Math.floor(min/60);if(h<24)return h+'h ago';return Math.floor(h/24)+'d ago';}
+function renderEngFindings(list){
+  $('engcount').textContent=list.length?('('+list.length+')'):'';
+  $('engfindings').innerHTML=list.map(function(f){
+    const fresh=f.age_min<15?' fresh':'';
+    return '<div class="finding-row'+fresh+'" onclick="showFinding(\''+esc(f.file)+'\')">'
+      +(f.severity?'<span class="sev '+sevClass(f.severity)+'">'+esc(f.severity)+'</span>':'')
+      +'<span class="ftitle">'+esc(f.title)+'</span>'
+      +'<span class="fage">'+ageText(f.age_min)+'</span></div>';
+  }).join('')||'<div class="muted">none yet…</div>';
+}
+async function pollEng(){
+  ENGPOLLING=true;
+  const e=await (await fetch('/api/engagement')).json();
+  if(!e.engagement){$('engmeta').innerHTML='<span class="muted">No engagement yet.</span>';clearTimeout(ENGTIMER);ENGTIMER=setTimeout(pollEng,8000);return;}
+  const modeLabel=e.mode==='interactive'?'interactive session':'auto-scan';
+  $('engmeta').innerHTML='<b>'+esc(e.engagement)+'</b> · '+modeLabel+' · '+(e.running?'<span class="ok">active…</span>':'<span class="muted">idle</span>')+' · '+e.findings.length+' findings';
+  if(e.latest){
+    $('enghero').innerHTML='<div class="hero" onclick="showFinding(\''+esc(e.latest.file)+'\')">'
+      +'<div class="muted">Latest finding · '+ageText(e.latest.age_min)+'</div>'
+      +'<div class="htitle">'+(e.latest.severity?'<span class="sev '+sevClass(e.latest.severity)+'">'+esc(e.latest.severity)+'</span>':'')+esc(e.latest.title)+'</div></div>';
+  } else { $('enghero').innerHTML=''; }
+  renderEngFindings(e.findings);
+  $('engactivity').textContent=e.activity||(e.mode==='interactive'?'(interactive session — activity streams to the Terminal window, not here; findings still update live on the left)':'(waiting for the agent…)');
+
+  // Nav badge + auto-open when a genuinely NEW finding shows up (not on first load).
+  if(e.latest){
+    if(LASTSEENFINDING!==null && e.latest.file!==LASTSEENFINDING){
+      $('engnavdot').style.display='inline-block';
+      if(document.querySelector('#t-engage.on')) showFinding(e.latest.file);
+    }
+    LASTSEENFINDING=e.latest.file;
+  }
+  clearTimeout(ENGTIMER);
+  ENGTIMER=setTimeout(pollEng, e.running?5000:12000);   // keep polling even when idle - an interactive session's "running" detection can lag
+}
+async function showFinding(file){
+  const r=await (await fetch('/api/finding?file='+encodeURIComponent(file))).json();
+  $('engdetail').innerHTML='<button onclick="pollEng()">← back to activity</button><pre style="max-height:none">'+esc(r.text||'')+'</pre>';
+  if($('engnavdot')) $('engnavdot').style.display='none';
+}
+
+
+let INSTTIMER=null;
+async function pollInstall(){
+  const r=await (await fetch('/api/install_status')).json();
+  $('installlog').textContent=r.log||'idle';
+  $('installlog').scrollTop=$('installlog').scrollHeight;
+  clearTimeout(INSTTIMER);
+  if(r.running) INSTTIMER=setTimeout(pollInstall,3000);
+}
+async function linkInstall(){
+  const src=$('apksrc').value.trim(); if(!src){alert('paste a link or path');return;}
+  await fetch('/api/install',{method:'POST',headers:{'content-type':'application/json'},
+    body:JSON.stringify({source:src,passive:$('apkpassive').checked})});
+  $('installlog').textContent='starting…'; setTimeout(pollInstall,800);
+}
+async function uploadInstall(){
+  const f=$('apkfile').files[0]; if(!f){alert('choose an APK first');return;}
+  $('installlog').textContent='uploading '+f.name+' ('+Math.round(f.size/1048576)+' MB)…';
+  const fd=new FormData(); fd.append('file',f);
+  const up=await (await fetch('/api/upload_apk',{method:'POST',body:fd})).json();
+  if(!up.ok){$('installlog').textContent='upload failed: '+(up.out||'');return;}
+  await fetch('/api/install',{method:'POST',headers:{'content-type':'application/json'},
+    body:JSON.stringify({source:up.path,passive:$('apkpassive').checked})});
+  $('installlog').textContent='uploaded, installing '+up.path+'…'; setTimeout(pollInstall,800);
+}
+
+load(); loadReqs(); pollEng();
+setInterval(load,5000);
+setInterval(()=>{if($('auto').checked)loadReqs()},8000);
+</script>
+"""
+
+
+class H(BaseHTTPRequestHandler):
+    def _send(self, code, body, ctype="application/json"):
+        b = body.encode() if isinstance(body, str) else body
+        self.send_response(code)
+        self.send_header("Content-Type", ctype)
+        self.send_header("Content-Length", str(len(b)))
+        self.send_header("Cache-Control", "no-store")
+        self.end_headers()
+        self.wfile.write(b)
+
+    def log_message(self, *a):
+        pass
+
+    def do_GET(self):
+        u = urlparse(self.path)
+        if u.path == "/":
+            return self._send(200, PAGE, "text/html; charset=utf-8")
+        if u.path == "/api/status":
+            return self._send(200, json.dumps(status()))
+        if u.path == "/api/apps":
+            return self._send(200, json.dumps(emulator_apps()))
+        if u.path == "/api/seen":
+            return self._send(200, json.dumps(apps_in_session()))
+        if u.path == "/api/scan_status":
+            lp = scan_log_path()
+            txt = ""
+            if lp.exists():
+                import subprocess as _sp
+                txt = _sp.run(["tail", "-c", "8000", str(lp)], capture_output=True, text=True).stdout
+            ps = subprocess.run(["bash", "-c", "ps -eo args"], capture_output=True, text=True).stdout
+            running = "bin/mp scan" in ps or "bin/mp scope" in ps
+            return self._send(200, json.dumps({"log": ANSI.sub("", txt), "running": running}))
+        if u.path == "/api/install_status":
+            lp = install_log_path()
+            txt = ""
+            if lp.exists():
+                import subprocess as _sp
+                txt = _sp.run(["tail", "-c", "8000", str(lp)], capture_output=True, text=True).stdout
+            running = any("install-app.sh" in l for l in
+                          __import__("subprocess").run(["bash","-c","ps -eo args"],capture_output=True,text=True).stdout.splitlines())
+            return self._send(200, json.dumps({"log": ANSI.sub("", txt), "running": running}))
+        if u.path == "/api/engagement":
+            return self._send(200, json.dumps(engagement_status()))
+        if u.path == "/api/finding":
+            q = parse_qs(u.query)
+            name = (q.get("file") or [""])[0]
+            if not re.match(r"^[A-Za-z0-9_.-]{1,80}\.md$", name):
+                return self._send(400, json.dumps({"error": "bad name"}))
+            engs = sorted((ROOT / "engagements").glob("*"),
+                          key=lambda p: p.stat().st_mtime, reverse=True)
+            engs = [e for e in engs if e.is_dir()]
+            if engs:
+                f = engs[0] / "findings" / name
+                if f.exists():
+                    return self._send(200, json.dumps({"text": f.read_text()[:40000]}))
+            return self._send(404, json.dumps({"error": "not found"}))
+        if u.path == "/api/burp_status":
+            q = parse_qs(u.query)
+            port = (q.get("port") or ["8080"])[0]
+            port = port if port.isdigit() else "8080"
+            out = subprocess.run(["lsof", "-nP", "-iTCP:" + port, "-sTCP:LISTEN"],
+                                 capture_output=True, text=True).stdout
+            owner = "none"
+            if "python" in out.lower():
+                owner = "mitmproxy"
+            elif "java" in out.lower():
+                owner = "burp"
+            elif out.strip():
+                owner = "other"
+            proxy = adb(["shell", "settings", "get", "global", "http_proxy"]).strip()
+            return self._send(200, json.dumps({"port": port, "owner": owner, "device_proxy": proxy}))
+        if u.path == "/api/creds":
+            q = parse_qs(u.query)
+            pkg = (q.get("pkg") or [""])[0]
+            if not pkg:
+                return self._send(400, json.dumps({"error": "pkg required"}))
+            return self._send(200, json.dumps(creds_mod().load(pkg)))
+        if u.path == "/api/totp":
+            q = parse_qs(u.query)
+            secret = (q.get("secret") or [""])[0]
+            try:
+                code, remaining = creds_mod().totp_now(secret)
+                return self._send(200, json.dumps({"code": code, "remaining": remaining}))
+            except Exception as e:
+                return self._send(400, json.dumps({"error": str(e)}))
+        if u.path == "/api/tree":
+            q = parse_qs(u.query)
+            app_f = (q.get("app") or [""])[0]
+            rows = recent_requests(app=app_f)
+            return self._send(200, json.dumps(build_tree(rows)))
+        if u.path == "/api/bypass":
+            return self._send(200, json.dumps(bypass_catalog()))
+        if u.path == "/api/flow":
+            q = parse_qs(u.query)
+            try:
+                i = int((q.get("i") or ["0"])[0])
+            except ValueError:
+                return self._send(400, json.dumps({"error": "bad index"}))
+            return self._send(200, json.dumps(flow_detail(i)))
+        if u.path == "/api/requests":
+            q = parse_qs(u.query)
+            return self._send(200, json.dumps(recent_requests(app=(q.get("app") or [""])[0])))
+        return self._send(404, json.dumps({"error": "not found"}))
+
+    def do_POST(self):
+        path = urlparse(self.path).path
+        if path == "/api/upload_apk":
+            try:
+                saved = save_upload(self.headers, self.rfile)
+                return self._send(200, json.dumps({"ok": True, "path": saved}))
+            except Exception as e:
+                return self._send(400, json.dumps({"ok": False, "out": str(e)}))
+        if path == "/api/creds":
+            n = int(self.headers.get("Content-Length") or 0)
+            try:
+                body = json.loads(self.rfile.read(n) or b"{}")
+            except Exception:
+                return self._send(400, json.dumps({"ok": False, "out": "bad json"}))
+            pkg = str(body.get("pkg", "")).strip()
+            if not pkg:
+                return self._send(400, json.dumps({"ok": False, "out": "pkg required"}))
+            fields = body.get("fields") or []
+            clean = []
+            for f in fields:
+                label = str(f.get("label", "")).strip()
+                if not label:
+                    continue
+                ftype = f.get("type") if f.get("type") in ("text", "password", "totp") else "text"
+                clean.append({"label": label, "value": str(f.get("value", "")), "type": ftype})
+            creds_mod().save(pkg, {"fields": clean, "notes": str(body.get("notes", ""))})
+            return self._send(200, json.dumps({"ok": True, "out": "saved"}))
+        if path == "/api/creds_type":
+            n = int(self.headers.get("Content-Length") or 0)
+            try:
+                body = json.loads(self.rfile.read(n) or b"{}")
+            except Exception:
+                return self._send(400, json.dumps({"ok": False, "out": "bad json"}))
+            text = str(body.get("text", ""))
+            cm = creds_mod()
+            r = cm.type_text(env(), text)
+            if r.returncode != 0:
+                return self._send(200, json.dumps({"ok": False, "out": r.stderr.strip() or "failed"}))
+            return self._send(200, json.dumps({"ok": True, "out": f"sent {len(text)} chars to the focused field"}))
+        if path == "/api/emulator_front":
+            creds_mod().bring_front()
+            return self._send(200, json.dumps({"ok": True, "out": "brought MuMu to the front"}))
+        if path == "/api/repeater_send":
+            n = int(self.headers.get("Content-Length") or 0)
+            try:
+                body = json.loads(self.rfile.read(n) or b"{}")
+            except Exception:
+                return self._send(400, json.dumps({"ok": False, "error": "bad json"}))
+            method = str(body.get("method", "GET")).upper().strip() or "GET"
+            url = str(body.get("url", "")).strip()
+            if not url.startswith(("http://", "https://")):
+                return self._send(400, json.dumps({"ok": False, "error": "url must start with http(s)://"}))
+            hdrs = {}
+            for line in str(body.get("headers", "")).splitlines():
+                if ":" in line:
+                    k, _, v = line.partition(":")
+                    k = k.strip()
+                    if k:
+                        hdrs[k] = v.strip()
+            result = repeater_send(method, url, hdrs, str(body.get("body", "")), bool(body.get("resign")))
+            return self._send(200, json.dumps(result))
+        if path == "/api/new_scan":
+            n = int(self.headers.get("Content-Length") or 0)
+            try:
+                body = json.loads(self.rfile.read(n) or b"{}")
+            except Exception:
+                return self._send(400, json.dumps({"ok": False, "out": "bad json"}))
+            src = str(body.get("source", "")).strip()
+            scope = str(body.get("scope", "")).strip()
+            run_new_scan(src, scope)
+            return self._send(200, json.dumps({"ok": True, "out": "scan started"}))
+        if path == "/api/install":
+            n = int(self.headers.get("Content-Length") or 0)
+            try:
+                body = json.loads(self.rfile.read(n) or b"{}")
+            except Exception:
+                return self._send(400, json.dumps({"ok": False, "out": "bad json"}))
+            src = str(body.get("source", "")).strip()
+            if not src:
+                return self._send(400, json.dumps({"ok": False, "out": "no source"}))
+            # allow: http(s) url, market/play link, id=pkg, or a local path under the lab
+            if not (src.startswith("http") or src.startswith("market:") or src.startswith("id=")
+                    or src.startswith(str(ROOT)) or src.startswith("/") or "." in src):
+                return self._send(400, json.dumps({"ok": False, "out": "unrecognised source"}))
+            run_install(src, bool(body.get("passive")))
+            return self._send(200, json.dumps({"ok": True, "out": "install started — watch the log"}))
+        if path != "/api/action":
+            return self._send(404, json.dumps({"error": "not found"}))
+        n = int(self.headers.get("Content-Length") or 0)
+        try:
+            body = json.loads(self.rfile.read(n) or b"{}")
+        except Exception:
+            return self._send(400, json.dumps({"ok": False, "out": "bad json"}))
+        ok, out = run_action(str(body.get("action", "")), str(body.get("arg", "")))
+        return self._send(200, json.dumps({"ok": ok, "out": out}))
+
+
+def main() -> int:
+    port = 8090
+    if "--port" in sys.argv:
+        port = int(sys.argv[sys.argv.index("--port") + 1])
+    if not shutil.which("adb"):
+        print("adb not on PATH", file=sys.stderr)
+        return 1
+    srv = ThreadingHTTPServer(("127.0.0.1", port), H)   # localhost only, by design
+    print(f"mp dashboard -> http://127.0.0.1:{port}")
+    print("bound to localhost only; it can run mp commands, so do not expose it")
+    try:
+        srv.serve_forever()
+    except KeyboardInterrupt:
+        print("\nstopped")
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

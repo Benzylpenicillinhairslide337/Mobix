@@ -1,0 +1,21 @@
+{
+  "scripts": {
+    "proxy-override": true,
+    "system-certificate-injection": true,
+    "certificate-unpinning": true,
+    "certificate-unpinning-fallback": true,
+    "disable-root-detection": true,
+    "anti-detection": true
+  },
+  "anti": {
+    "Build": true,
+    "Build.VERSION": true,
+    "SystemProperties": true,
+    "File.exists": true,
+    "Debug": true,
+    "BufferedReader": true,
+    "Runtime.exec": true,
+    "TelephonyManager": true,
+    "SensorManager": true
+  }
+}
