@@ -15,6 +15,7 @@ command.
   <a href="https://github.com/blackfoxxx/Mobix/blob/master/LICENSE"><img src="https://img.shields.io/badge/license-MIT-blue.svg" alt="MIT License"></a>
   <img src="https://img.shields.io/badge/platform-macOS%20(Apple%20Silicon)-lightgrey.svg" alt="macOS Apple Silicon">
   <img src="https://img.shields.io/badge/MCP-36%20tools-6e56cf.svg" alt="36 MCP tools">
+  <a href="https://glama.ai/mcp/servers/blackfoxxx/Mobix"><img src="https://glama.ai/mcp/servers/blackfoxxx/Mobix/badges/score.svg" alt="blackfoxxx/Mobix MCP server"></a>
   <a href="https://github.com/blackfoxxx/Mobix/stargazers"><img src="https://img.shields.io/github/stars/blackfoxxx/Mobix?style=social" alt="GitHub stars"></a>
 </p>
 
