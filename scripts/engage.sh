@@ -28,8 +28,14 @@ for a in "$@"; do
 done
 [ -z "$PKG" ] && PKG=$(grep -E '^TARGET=' "$MP_ROOT/config" 2>/dev/null | cut -d'"' -f2)
 [ -z "$PKG" ] && { echo "usage: engage.sh <package> [--auto]"; exit 1; }
+# PKG builds ENG (path traversal via ../ otherwise) and flows into an
+# unquoted osascript heredoc via FIRST below (AppleScript/shell injection on
+# the Mac otherwise, since bash expands the heredoc before osascript runs).
+# Directly-runnable script, so this can't rely on bin/mp's own check.
+[[ "$PKG" =~ ^[A-Za-z0-9_.-]{1,128}$ ]] || { echo "invalid package name: $PKG" >&2; exit 1; }
 
 SCOPE=$(grep -E '^SCOPE=' "$MP_ROOT/config" 2>/dev/null | cut -d'"' -f2)
+[ -n "$SCOPE" ] && ! [[ "$SCOPE" =~ ^[A-Za-z0-9_.,:-]{0,200}$ ]] && SCOPE=""
 STAMP=$(date +%Y%m%d-%H%M%S)
 ENG="$MP_ROOT/engagements/${PKG}_${STAMP}"
 mkdir -p "$ENG/findings"

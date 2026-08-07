@@ -230,7 +230,20 @@ def list_engagements_full() -> list[dict]:
         sid_f = d / ".session_id"
         mode_f = d / ".mode"
         sid = sid_f.read_text().strip() if sid_f.exists() else ""
-        mode = mode_f.read_text().strip() if mode_f.exists() else ("auto" if (d / ".agent.pid").exists() else "")
+        if mode_f.exists():
+            mode = mode_f.read_text().strip()
+        elif (d / ".agent.pid").exists():
+            mode = "auto"
+        elif (d / "scan.log").exists():
+            # .agent.pid is deleted once an auto agent stops/finishes (see
+            # cmd_engage --stop), which is the common case by the time this
+            # is viewed - scan.log is auto-only and never gets cleaned up, so
+            # it's the reliable signal for engagements older than .mode.
+            mode = "auto"
+        elif (d / "CLAUDE.md").exists():
+            mode = "interactive"
+        else:
+            mode = ""
         fdir = d / "findings"
         findings = len(list(fdir.glob("*.md"))) if fdir.exists() else 0
         running = False
@@ -755,8 +768,10 @@ def run_action(action: str, arg: str) -> tuple[bool, str]:
         s = active_session()
         if not s:
             return False, "no session yet"
-        threading.Thread(target=lambda: sh(
-            ["bash", "-c", f'"{MP}" web {arg or "*"} >/dev/null 2>&1'], 600), daemon=True).start()
+        web_arg = arg or "*"
+        if not re.match(r"^(\*|[A-Za-z0-9_.]{1,128})$", web_arg):
+            return False, "invalid app filter"
+        threading.Thread(target=lambda: sh([MP, "web", web_arg], 600), daemon=True).start()
         return True, "mitmweb starting on :8081 — check its console for the token URL"
     return False, f"unknown action: {action}"
 
@@ -1114,6 +1129,8 @@ h3{font-size:11px;text-transform:uppercase;letter-spacing:.07em;color:var(--mut)
       <b>Sessions</b>
       <span class="muted">every past capture + Claude Code engagement — nothing here is ever deleted by a new scan</span>
       <div style="flex:1"></div>
+      <input id="sessFilter" placeholder="filter by target…" oninput="renderSessLists()" style="width:180px">
+      <label class="muted"><input type="checkbox" id="sessHideEmpty" checked onchange="renderSessLists()"> hide empty</label>
       <button onclick="loadSessions()">Refresh</button>
     </div>
     <div class="split">
@@ -1369,7 +1386,11 @@ function tab(n){document.querySelectorAll('.tab').forEach(e=>e.classList.remove(
   if(n==='bypass')loadBypass(); if(n==='apps')loadApps(); if(n==='engage'){pollEng();var d=$('engnavdot');if(d)d.style.display='none';} if(n==='install')pollInstall(); if(n==='login'&&!CREDPKG)loadCredsForCurrentTarget(); if(n==='services')loadBurpStatus(); if(n==='sessions')loadSessions();}
 function dot(v){return `<span class="dot" style="background:${v?'var(--ok)':'var(--bad)'}"></span>`}
 function row(k,v){return `<div class="row"><b>${k}</b><span>${v}</span></div>`}
-function esc(s){return (s==null?'':String(s)).replace(/[&<>]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;'}[c]))}
+// Captured-traffic values (host, path, headers) are attacker-controlled by
+// whatever app is under test and land in double-quoted HTML attributes
+// (title="...") via innerHTML - encoding quotes too, not just &<>, closes a
+// real XSS vector (a path like `/foo" onmouseover="...` otherwise breaks out).
+function esc(s){return (s==null?'':String(s)).replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]))}
 
 // draggable splitter
 (function(){let drag=false;const g=$('gut'),d=$('detail');
@@ -1490,17 +1511,29 @@ function agoText(sec){
 }
 function renderSessLists(){
   const now=Date.now()/1000;
-  $('sessCount').textContent='('+SESSDATA.sessions.length+')';
-  $('engListCount').textContent='('+SESSDATA.engagements.length+')';
-  $('sessList').innerHTML=SESSDATA.sessions.map(s=>
+  const q=($('sessFilter')&&$('sessFilter').value||'').trim().toLowerCase();
+  const hideEmpty=$('sessHideEmpty')&&$('sessHideEmpty').checked;
+  const sessAll=SESSDATA.sessions;
+  const sess=sessAll.filter(s=>{
+    if(hideEmpty && !s.live && !s.flows) return false;
+    if(q && !(s.target||'').toLowerCase().includes(q)) return false;
+    return true;
+  });
+  const engAll=SESSDATA.engagements;
+  const eng=engAll.filter(e=>!q || (e.pkg||'').toLowerCase().includes(q));
+  $('sessCount').textContent='('+sess.length+(sess.length!==sessAll.length?' of '+sessAll.length:'')+')';
+  $('engListCount').textContent='('+eng.length+(eng.length!==engAll.length?' of '+engAll.length:'')+')';
+  $('sessList').innerHTML=sess.map(s=>
     '<div class="app'+(s.name===VIEWSESS?' sel':'')+'" onclick="viewSession(\''+esc(s.name)+'\')">'
     +'<span>'+(esc(s.target)||'<span class="muted">(unknown target)</span>')+(s.live?' <b class="ok">live</b>':'')+'</span>'
-    +'<small>'+s.flows+' flows · '+agoText(now-s.mtime)+'</small></div>').join('') || '<div class="muted">none yet</div>';
-  $('engList').innerHTML=SESSDATA.engagements.map(e=>
-    '<div class="app"><span>'+esc(e.pkg)+' <small class="muted">'+esc(e.mode||'?')+'</small>'+(e.running?' <b class="ok">running</b>':'')+'</span>'
+    +'<small>'+s.flows+' flows · '+agoText(now-s.mtime)+'</small></div>').join('')
+    || (sessAll.length?'<div class="muted">nothing matches this filter</div>':'<div class="muted">none yet</div>');
+  $('engList').innerHTML=eng.map(e=>
+    '<div class="app"><span>'+esc(e.pkg)+' <small class="muted">'+esc(e.mode||'mode unknown')+'</small>'+(e.running?' <b class="ok">running</b>':'')+'</span>'
     +'<small>'+e.findings+' finding'+(e.findings===1?'':'s')+' · '+agoText(now-e.mtime)
     +(e.session_id?' · <a href="javascript:resumeEngagement(\''+esc(e.name)+'\')">resume</a>':' · not resumable')
-    +'</small></div>').join('') || '<div class="muted">none yet</div>';
+    +'</small></div>').join('')
+    || (engAll.length?'<div class="muted">nothing matches this filter</div>':'<div class="muted">none yet</div>');
 }
 async function loadSessions(){
   SESSDATA=await (await fetch('/api/all_sessions')).json();
@@ -1635,6 +1668,14 @@ function renderEngFindings(list){
 }
 async function pollEng(){
   ENGPOLLING=true;
+  // showFinding() replaces #engdetail's whole innerHTML, destroying the
+  // #engactivity child this function writes to below ("back to activity"
+  // calls pollEng() directly to restore it) - without this, the next write
+  // throws on a null element and silently kills the self-rescheduling timer
+  // for good (no more auto-refresh) until a full page reload.
+  if(!$('engactivity') && $('engdetail')){
+    $('engdetail').innerHTML='<h3>Live activity</h3><pre id="engactivity" style="max-height:none">&mdash;</pre>';
+  }
   const e=await (await fetch('/api/engagement')).json();
   if(!e.engagement){$('engmeta').innerHTML='<span class="muted">No engagement yet.</span>';clearTimeout(ENGTIMER);ENGTIMER=setTimeout(pollEng,8000);return;}
   const modeLabel=e.mode==='interactive'?'interactive session':'auto-scan';
@@ -1877,6 +1918,14 @@ class H(BaseHTTPRequestHandler):
                 return self._send(400, json.dumps({"ok": False, "out": "bad json"}))
             src = str(body.get("source", "")).strip()
             scope = str(body.get("scope", "")).strip()
+            # scope is simple (host-shaped) so validate it here for a fast,
+            # clear rejection. source's valid shapes are more varied (package
+            # name/search term, .apk path, URL, Play Store link) and `mp scan`
+            # itself already validates the package/search-term case since the
+            # scripts/mp fix for the same class of bug - re-deriving that
+            # logic here would just risk drifting out of sync with it.
+            if scope and not HOST_RE.match(scope):
+                return self._send(400, json.dumps({"ok": False, "out": "invalid scope"}))
             run_new_scan(src, scope)
             return self._send(200, json.dumps({"ok": True, "out": "scan started"}))
         if path == "/api/install":

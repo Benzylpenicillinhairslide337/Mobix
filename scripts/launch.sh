@@ -33,6 +33,11 @@ case "${1:-}" in
 esac
 
 PKG="${1:?usage: launch.sh <package> [--attach] | --stop | --log}"; shift || true
+# Interpolated into `adb shell "...$PKG..."` below - the DEVICE's shell
+# parses that string, so an unvalidated PKG is command injection on the
+# device (root adbd on this lab). Directly-runnable script, so this check
+# can't rely on bin/mp having already validated its argument.
+[[ "$PKG" =~ ^[A-Za-z0-9_.-]{1,128}$ ]] || { echo "invalid package name: $PKG" >&2; exit 1; }
 MODE="-f"
 for a in "$@"; do [ "$a" = "--attach" ] && MODE="-n"; done
 mkdir -p "$MP_LOOT"
@@ -51,9 +56,6 @@ if [ -n "$PREV" ] && [ "$PREV" != "$PKG" ]; then
   echo "[*] stopping previously hooked app: $PREV"
   adb -s "$MP_DEVICE" shell "am force-stop $PREV" >/dev/null 2>&1
 fi
-
-# Record the hooked package so the capture feed can attribute flows to it.
-echo "$PKG" > "$MP_ROOT/.active-app"
 
 # Which bypass modules load is selectable (bypass.json, or the dashboard), so
 # ask bypass.py for the -l flags instead of hardcoding the chain here. It also
@@ -91,6 +93,10 @@ while [ "$attempt" -le 2 ]; do
 done
 
 if pgrep -f "frida -U $MODE $PKG" >/dev/null 2>&1; then
+  # Only now, confirmed hooked - not up front - so a failed launch never
+  # leaves .active-app (and therefore `mp status`'s "hooks" reading) claiming
+  # a package is hooked when nothing actually is.
+  echo "$PKG" > "$MP_ROOT/.active-app"
   echo "[+] $PKG running with bypasses active - use the app normally."
   printf "    root checks blocked: %s\n" "$(grep -c 'Blocked possible root detection' "$LOGF")"
   grep -qE "Certificate unpinning completed" "$LOGF" && echo "    SSL unpinning:       active"
@@ -98,5 +104,18 @@ if pgrep -f "frida -U $MODE $PKG" >/dev/null 2>&1; then
   echo "    log:  $DIR/launch.sh --log"
   echo "    stop: $DIR/launch.sh --stop"
 else
+  # A failed spawn can leave frida hung at its own interactive prompt (stdin
+  # is `tail -f /dev/null`, which never closes, so it never gets EOF and
+  # never exits on its own) rather than actually terminating - confirmed live:
+  # the wrapper process survives well after this script exits, and its
+  # command line still contains "frida -U -f '<pkg>'" as text, so it keeps
+  # matching every `pgrep -f 'frida -U -[fn] '` health check downstream
+  # (`mp status`, the dashboard, MCP lab_status) into falsely reporting
+  # "hooks: held" for a launch that never actually worked. Leave nothing
+  # alive behind a reported failure.
+  pkill -P "$(cat "$PIDF" 2>/dev/null)" 2>/dev/null
+  kill "$(cat "$PIDF" 2>/dev/null)" 2>/dev/null
+  pkill -f "frida -U $MODE '$PKG'" 2>/dev/null
+  rm -f "$PIDF" "$MP_ROOT/.active-app"
   echo "[!] session did not hold:"; tail -20 "$LOGF"; exit 1
 fi

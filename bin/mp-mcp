@@ -436,10 +436,20 @@ def t_lab_sessions(_) -> str:
                     os.kill(int(pid_f.read_text().strip()), 0); running = True
                 except Exception:
                     running = False
+            if mode_f.exists():
+                mode = mode_f.read_text().strip()
+            elif pid_f.exists():
+                mode = "auto"
+            elif (d / "scan.log").exists():
+                mode = "auto"
+            elif (d / "CLAUDE.md").exists():
+                mode = "interactive"
+            else:
+                mode = ""
             eng_out.append({
                 "name": d.name, "pkg": pkg,
                 "session_id": sid_f.read_text().strip() if sid_f.exists() else "",
-                "mode": mode_f.read_text().strip() if mode_f.exists() else "",
+                "mode": mode,
                 "findings": len(list(fdir.glob("*.md"))) if fdir.exists() else 0,
                 "running": running,
             })

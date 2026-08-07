@@ -60,8 +60,11 @@ install_local() {
 NEWPKG=""
 case "$SRC" in
   http*://*play.google.com/*|market://*|id=*)
+    # Only ever accept the id from the safe-charset grep match below - a raw
+    # `${SRC#id=}` fallback here would let an unvalidated string (a single
+    # quote breaks out of the 'market://...' single-quoted URI on the device
+    # shell at the `A shell` call further down) reach the device shell.
     PKG=$(printf '%s' "$SRC" | grep -oE 'id=[A-Za-z0-9_.]+' | head -1 | cut -d= -f2)
-    [ -z "$PKG" ] && PKG="${SRC#id=}"
     [ -z "$PKG" ] && { err "could not read a package id from: $SRC"; exit 1; }
     warn "[*] Play Store install — opening the store page on the device."
     warn "    Complete the install there (Google sign-in / payment can't be automated)."

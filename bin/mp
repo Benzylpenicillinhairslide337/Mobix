@@ -25,6 +25,12 @@ TARGET="${TARGET:-}"
 SCOPE="${SCOPE:-}"
 
 save_conf() {
+  # Last line of defense: config is `source`d by every future `mp` run, so an
+  # unvalidated TARGET/SCOPE written here is persistent command injection on
+  # the HOST, not just the device. Every call site validates before setting
+  # these, but this check must hold even if one doesn't.
+  [ -n "$TARGET" ] && ! [[ "$TARGET" =~ $PKG_RE ]] && { c_err "refusing to save invalid target: $TARGET"; exit 1; }
+  [ -n "$SCOPE" ] && ! [[ "$SCOPE" =~ $HOST_RE ]] && { c_err "refusing to save invalid scope: $SCOPE"; exit 1; }
   { echo "# mp config - written by 'mp target' / 'mp apps'"
     echo "TARGET=\"$TARGET\""
     echo "SCOPE=\"$SCOPE\""
@@ -36,6 +42,18 @@ c_ok()   { printf "\033[32m%s\033[0m\n" "$*"; }
 c_warn() { printf "\033[33m%s\033[0m\n" "$*"; }
 c_err()  { printf "\033[31m%s\033[0m\n" "$*"; }
 c_dim()  { printf "\033[2m%s\033[0m\n" "$*"; }
+
+# Package/scope values get interpolated into `adb shell "...$x..."` strings
+# (which the DEVICE's shell then parses - `;`, `` ` ``, `$()` etc. are live)
+# and into $MP_ROOT/config, which every future `mp` invocation `source`s (so
+# an unvalidated value there is host command injection, not device). Never
+# let user input reach either sink before this check. Hyphens are tolerated
+# for fuzzy substring searches (`mp scan yango-play`) even though real
+# package names never contain one.
+PKG_RE='^[A-Za-z0-9_.-]{1,128}$'
+valid_pkg() { [[ "$1" =~ $PKG_RE ]]; }
+HOST_RE='^[A-Za-z0-9_.,:-]{0,200}$'
+valid_scope() { [[ "$1" =~ $HOST_RE ]]; }
 
 need_target() {
   [ -n "$TARGET" ] && return 0
@@ -213,6 +231,7 @@ cmd_auto() {
 
 cmd_target() {
   if [ $# -eq 0 ]; then echo "${TARGET:-(none)}"; return 0; fi
+  valid_pkg "$1" || { c_err "invalid package name: $1"; exit 1; }
   TARGET="$1"; save_conf; c_ok "target = $TARGET"
   # A running capture/hook still belongs to the OLD app until you relaunch.
   if pgrep -f 'frida -U -[fn] ' >/dev/null 2>&1 || lsof -nP -iTCP:"$MP_PROXY_PORT" -sTCP:LISTEN >/dev/null 2>&1; then
@@ -221,12 +240,15 @@ cmd_target() {
 }
 
 cmd_scope() {
-  if [ $# -eq 0 ]; then echo "${SCOPE:-(all hosts)}"; else SCOPE="$1"; save_conf; c_ok "scope = $SCOPE"; fi
+  if [ $# -eq 0 ]; then echo "${SCOPE:-(all hosts)}"; return 0; fi
+  [ -n "$1" ] && ! valid_scope "$1" && { c_err "invalid scope: $1"; exit 1; }
+  SCOPE="$1"; save_conf; c_ok "scope = $SCOPE"
 }
 
 cmd_launch() {
   local pkg="${1:-$TARGET}"
   [ -z "$pkg" ] && need_target
+  valid_pkg "$pkg" || { c_err "invalid package name: $pkg"; exit 1; }
   "$SCRIPTS/launch.sh" "$pkg" "${@:2}"
 }
 
@@ -272,6 +294,7 @@ cmd_scan() {
     "$SCRIPTS/install-app.sh" "$src" --no-scan || exit 1
     . "$CONF"; pkg="$TARGET"
   else
+    valid_pkg "$src" || { c_err "invalid package name / search term: $src"; exit 1; }
     local exact; exact=$(A shell "pm list packages $src" 2>/dev/null | tr -d '\r' | grep -x "package:$src")
     if [ -n "$exact" ]; then
       pkg="$src"
@@ -294,6 +317,7 @@ cmd_scan() {
     fi
   fi
   [ -z "$pkg" ] && { c_err "no target resolved"; exit 1; }
+  valid_pkg "$pkg" || { c_err "resolved target failed validation: $pkg"; exit 1; }
   c_ok "      $pkg"
 
   # Always start clean: stop the old hooks/capture, force-stop the outgoing
@@ -335,7 +359,15 @@ cmd_scan() {
 
   echo "[4/4] app"
   "$SCRIPTS/launch.sh" "$pkg" 2>&1 \
-    | grep -E "running with|root checks|SSL unpinning|proxy override" | sed 's/^/      /'
+    | grep -E "running with|root checks|SSL unpinning|proxy override|session did not hold" | sed 's/^/      /'
+  # ${PIPESTATUS[0]} is launch.sh's own exit code, not grep's - piping through
+  # a whitelist grep must never swallow a failure into a fake "Ready" below.
+  local launch_rc="${PIPESTATUS[0]}"
+  if [ "$launch_rc" -ne 0 ]; then
+    c_err "hook failed to hold - see: $SCRIPTS/launch.sh --log"
+    c_warn "capture is running but nothing is hooked - traffic will only show background noise, not $pkg"
+    exit 1
+  fi
 
   echo
   c_ok "Ready — traffic is live. Use the app now."
@@ -356,6 +388,7 @@ cmd_capture() {
 cmd_switch() {
   local pkg="${1:-}"
   [ -z "$pkg" ] && { c_err "usage: mp switch <package>   (see: mp apps)"; exit 1; }
+  valid_pkg "$pkg" || { c_err "invalid package name: $pkg"; exit 1; }
   echo "[*] switching target -> $pkg"
   # Force-stop the OUTGOING app now, before cmd_stop wipes .active-app - a
   # backgrounded old app keeps phoning home and pollutes the new session.
@@ -401,7 +434,11 @@ cmd_go() {
     c_ok "capture -> $sess"
     [ -n "$SCOPE" ] && c_dim "  scope: $SCOPE" || c_dim "  scope: all hosts"
   fi
-  "$SCRIPTS/launch.sh" "$TARGET"
+  if ! "$SCRIPTS/launch.sh" "$TARGET"; then
+    c_err "hook failed to hold - see: $SCRIPTS/launch.sh --log"
+    c_warn "capture is running but nothing is hooked - traffic will only show background noise, not $TARGET"
+    exit 1
+  fi
   echo
   c_dim "when finished:  mp analyze     (then read index.md / surface.md / FINDINGS)"
 }
@@ -555,6 +592,11 @@ cmd_engage() {
   if [ "${1:-}" = "--resume" ]; then
     local name="${2:-}" eng sid
     [ -z "$name" ] && { c_err "usage: mp engage --resume <engagement-dir-name>   (see: mp sessions)"; exit 1; }
+    # $eng/$sid are interpolated into an unquoted osascript heredoc below -
+    # bash expands them before osascript runs, so an unvalidated name is
+    # AppleScript/shell injection on the host Mac (`[ -d "$eng" ]` alone only
+    # confirms the resulting path exists, not that it's injection-safe).
+    [[ "$name" =~ ^[A-Za-z0-9_.-]{1,160}$ ]] || { c_err "invalid engagement name: $name"; exit 1; }
     eng="$MP_ROOT/engagements/$name"
     [ -d "$eng" ] || { c_err "no engagement folder: $eng"; exit 1; }
     sid=$(cat "$eng/.session_id" 2>/dev/null)
@@ -578,7 +620,12 @@ cmd_brief() {
   python3 "$SCRIPTS/brief.py" "$sess"
 }
 
-cmd_pull()  { "$SCRIPTS/pull-apk.sh" "${1:-$TARGET}"; }
+cmd_pull()  {
+  local pkg="${1:-$TARGET}"
+  [ -z "$pkg" ] && need_target
+  valid_pkg "$pkg" || { c_err "invalid package name: $pkg"; exit 1; }
+  "$SCRIPTS/pull-apk.sh" "$pkg"
+}
 cmd_static()  {
   local apk="${1:-}"
   [ -z "$apk" ] && { need_target; apk="$MP_APKS/$TARGET/base.apk"; }

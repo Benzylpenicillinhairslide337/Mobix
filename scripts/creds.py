@@ -43,8 +43,9 @@ CREDS_DIR = ROOT / "creds"
 def device_serial() -> str:
     """Resolve the current adb serial the same way scripts/env.sh does - the
     MuMu serial is not stable across restarts, so this must never be cached."""
+    env_sh = _posix_squote(str(ROOT / "scripts" / "env.sh"))
     out = subprocess.run(
-        ["bash", "-c", f". '{ROOT}/scripts/env.sh'; echo \"$MP_DEVICE\""],
+        ["bash", "-c", f". {env_sh}; echo \"$MP_DEVICE\""],
         capture_output=True, text=True, timeout=20).stdout.strip()
     return out.splitlines()[-1] if out else "emulator-5554"
 
