@@ -1,6 +1,20 @@
 # Mobix
 
-Authorized mobile-app penetration testing lab on MuMu Player Pro (macOS / Apple Silicon).
+**An Android pentest lab you can drive by hand or hand to an AI agent.**
+
+Root+SSL-pinning bypass, live traffic capture, and a web dashboard are the
+table stakes — plenty of Frida wrappers do that. What's different: a 36-tool
+MCP control plane means a Claude Code session can run the whole loop itself —
+scan an app, watch its traffic, flag IDOR candidates automatically, write
+evidence-backed findings — while staying inside a hard-coded read-only
+allowlist for the unattended path. One line to install, one command to scan.
+
+<p align="center">
+  <a href="https://github.com/blackfoxxx/Mobix/blob/master/LICENSE"><img src="https://img.shields.io/badge/license-MIT-blue.svg" alt="MIT License"></a>
+  <img src="https://img.shields.io/badge/platform-macOS%20(Apple%20Silicon)-lightgrey.svg" alt="macOS Apple Silicon">
+  <img src="https://img.shields.io/badge/MCP-36%20tools-6e56cf.svg" alt="36 MCP tools">
+  <a href="https://github.com/blackfoxxx/Mobix/stargazers"><img src="https://img.shields.io/github/stars/blackfoxxx/Mobix?style=social" alt="GitHub stars"></a>
+</p>
 
 <p align="center">
   <img src="docs/screenshots/claude-analysis-findings.jpg" width="49%" alt="Claude Analysis tab: live findings list with severities and a hero card for the latest finding">
@@ -9,6 +23,43 @@ Authorized mobile-app penetration testing lab on MuMu Player Pro (macOS / Apple 
 
 > All screenshots on this page use a synthetic demo app/traffic/findings — no real
 > target data. See [Screenshots](#screenshots) below for the full set, one per tab.
+
+**If this is useful to you, a ⭐ helps other pentesters find it — genuinely
+appreciated.**
+
+<details>
+<summary><b>Contents</b> (click to expand)</summary>
+
+- [Installing](#installing)
+- [Starting a scan](#starting-a-scan)
+- [Switching to Burp from the dashboard](#switching-to-burp-from-the-dashboard)
+- [Web dashboard](#web-dashboard)
+- [Screenshots](#screenshots)
+- [Quick start — the `mp` command](#quick-start--the-mp-command)
+- [Device](#device)
+- [Layout](#layout)
+- [Underlying scripts](#underlying-scripts)
+- [Scripts](#scripts)
+- [Interception: three layers](#interception-three-layers)
+- [Using Burp instead of mitmproxy](#using-burp-instead-of-mitmproxy)
+- [Feeding traffic to Claude Code](#feeding-traffic-to-claude-code)
+- [Where the requests are](#where-the-requests-are)
+- [Web pentest with Burp](#web-pentest-with-burp)
+- [Inspecting one app's traffic](#inspecting-one-apps-traffic)
+- [Claude Code engagements (`mp engage`)](#claude-code-engagements-mp-engage)
+- [Sessions & resuming](#sessions--resuming)
+- [Logging in](#logging-in)
+- [Site map & Repeater](#site-map--repeater)
+- [Wiring traffic into Claude Code (lightweight)](#wiring-traffic-into-claude-code-lightweight)
+- [Static analysis](#static-analysis)
+- [Runtime exploration](#runtime-exploration)
+- [Installing an app](#installing-an-app)
+- [Switching apps](#switching-apps)
+- [Apps that refuse to run on a rooted device](#apps-that-refuse-to-run-on-a-rooted-device)
+- [Gotchas](#gotchas)
+- [Scope discipline](#scope-discipline)
+
+</details>
 
 ## Installing
 
