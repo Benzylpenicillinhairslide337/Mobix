@@ -3,13 +3,25 @@
 Authorized mobile-app penetration testing lab on MuMu Player Pro (macOS / Apple Silicon).
 
 <p align="center">
-  <img src="docs/screenshots/bypass-modules.png" width="49%" alt="Bypass modules panel: Frida scripts and anti-detection toggles">
-  <img src="docs/screenshots/services-dashboard.png" width="49%" alt="Services panel: environment status, capture/MobSF controls, Burp switch">
+  <img src="docs/screenshots/claude-analysis-findings.jpg" width="49%" alt="Claude Analysis tab: live findings list with severities and a hero card for the latest finding">
+  <img src="docs/screenshots/traffic.jpg" width="49%" alt="Traffic tab: site-map tree, captured requests, and a decoded request/response detail pane">
 </p>
+
+> All screenshots on this page use a synthetic demo app/traffic/findings — no real
+> target data. See [Screenshots](#screenshots) below for the full set, one per tab.
 
 ## Installing
 
+One line, on a fresh machine — clones this repo to `~/mobile-pentest` (override
+with `MP_ROOT=/some/path`), then runs the installer below:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/blackfoxxx/Mobix/master/scripts/bootstrap.sh | bash
 ```
+
+Already cloned it yourself? Run the installer directly instead:
+
+```bash
 scripts/install.sh      # installs everything this lab depends on
 mp doctor                # verifies it actually works (not just "present")
 ```
@@ -105,13 +117,25 @@ cert, it doesn't touch a running capture.
 mp dash            # http://127.0.0.1:8090
 ```
 
-Four tabs:
+Eight tabs:
 
-**Traffic** — master/detail inspector with a draggable splitter. Click any
-request to see its headers, pretty-printed request and response bodies, decoded
-base64 payloads (`requestBody` / `responseBody` are unwrapped automatically),
-flags and IDOR candidates. Free-text filter plus a per-app dropdown. You do not
-need to open mitmweb for normal inspection.
+**Install** — upload an APK/bundle or paste a link/Play Store URL; runs static
+analysis and (unless passive) hooks it with a live capture. Log streams on the
+right.
+
+**Traffic** — master/detail inspector with a draggable splitter, plus a
+host/path tree on the left to filter by API surface. Click any request to see
+its headers, pretty-printed request and response bodies, decoded base64
+payloads (`requestBody` / `responseBody` are unwrapped automatically), flags
+and IDOR candidates. Free-text filter plus a per-app dropdown. You do not need
+to open mitmweb for normal inspection.
+
+**Repeater** — edit method/URL/headers/body and resend directly from the Mac
+(no device hop). Auto-detects a `macIn`-style integrity field and offers to
+re-sign it. Keeps the last 25 sends this session.
+
+**Login** — stored per-app credential fields (text/password/TOTP with a live
+code), "Send" pushes a value into whatever field is focused in MuMu.
 
 **Bypass** — a checkbox per module, with descriptions. Six Frida scripts
 (proxy override, cert injection, unpinning, unpinning fallback, root detection,
@@ -125,7 +149,12 @@ its `-l` flag; turning an anti-detection module off writes it into
 **Apps** — emulator packages with running markers, click to set the target,
 plus scope entry and Pull APK.
 
-**Services** — environment and service state, with the remaining actions.
+**Services** — environment and service state, MobSF/Burp controls, with the
+remaining actions.
+
+**Claude Analysis** — the live findings list from an `mp engage` run (interactive
+or `--auto`), with a hero card for the latest finding and a live-activity feed.
+See [Claude Code engagements](#claude-code-engagements-mp-engage).
 
 The **Emulator apps** panel lists packages installed on the *Android device*
 (`pm list packages -3`), marks which are running, and sets the target on click.
@@ -136,6 +165,29 @@ commands, so exposing it on a routable interface would hand the whole toolkit to
 anyone who can reach it. Actions are a fixed whitelist and package/scope
 arguments are regex-validated, but do not put it behind a tunnel or bind it to
 `0.0.0.0`.
+
+## Screenshots
+
+All of the below use a synthetic demo app (`com.example.bankapp`) with fabricated
+traffic and findings — none of this is real target data.
+
+<table>
+<tr>
+<td width="33%"><img src="docs/screenshots/install.jpg" alt="Install tab"><br><sub>Install — upload/link an APK, static analysis + capture starts automatically</sub></td>
+<td width="33%"><img src="docs/screenshots/traffic.jpg" alt="Traffic tab"><br><sub>Traffic — host tree, request list, decoded detail pane</sub></td>
+<td width="33%"><img src="docs/screenshots/repeater.jpg" alt="Repeater tab"><br><sub>Repeater — edit and resend, with macIn re-signing and history</sub></td>
+</tr>
+<tr>
+<td width="33%"><img src="docs/screenshots/login.jpg" alt="Login tab"><br><sub>Login — stored test creds incl. live TOTP, push into a focused field</sub></td>
+<td width="33%"><img src="docs/screenshots/bypass-modules.jpg" alt="Bypass tab"><br><sub>Bypass — Frida scripts and anti-detection modules, toggle per launch</sub></td>
+<td width="33%"><img src="docs/screenshots/apps.jpg" alt="Apps tab"><br><sub>Apps — installed packages, click to set target</sub></td>
+</tr>
+<tr>
+<td width="33%"><img src="docs/screenshots/services-dashboard.jpg" alt="Services tab"><br><sub>Services — environment status, capture/MobSF controls, Burp switch</sub></td>
+<td width="33%"><img src="docs/screenshots/claude-analysis-findings.jpg" alt="Claude Analysis tab"><br><sub>Claude Analysis — live findings by severity, latest-finding hero card</sub></td>
+<td width="33%"><img src="docs/screenshots/new-scan-modal.jpg" alt="New scan modal"><br><sub>New scan — one target, one fresh session, mirrors <code>mp scan</code></sub></td>
+</tr>
+</table>
 
 ## Quick start — the `mp` command
 
