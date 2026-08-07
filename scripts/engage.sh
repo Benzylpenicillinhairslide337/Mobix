@@ -34,6 +34,13 @@ STAMP=$(date +%Y%m%d-%H%M%S)
 ENG="$MP_ROOT/engagements/${PKG}_${STAMP}"
 mkdir -p "$ENG/findings"
 
+# Pin a session ID so this conversation can be picked back up later with
+# `mp engage --resume <engagement-dir-name>` (or the dashboard's Sessions
+# tab), same as `claude --resume <id>` would from this directory.
+SID=$(uuidgen | tr '[:upper:]' '[:lower:]')
+echo "$SID" > "$ENG/.session_id"
+echo "$MODE" > "$ENG/.mode"
+
 # Point the engagement at the live capture session (wherever the proxy is writing).
 SESS=$(ps -eo args 2>/dev/null | grep '[m]itmdump' | tr ' ' '\n' | grep -m1 '^feedout=' | cut -d= -f2-)
 [ -z "$SESS" ] && SESS=$(ls -td "$MP_LOOT"/session-*/ 2>/dev/null | head -1 | sed 's:/$::')
@@ -104,6 +111,7 @@ if [ "$MODE" = "auto" ]; then
   # Analysis-only allowlist: live traffic + read + write findings + research +
   # skills. No Bash, no request sending - active testing stays interactive.
   nohup claude -p "$FIRST" \
+    --session-id "$SID" \
     --add-dir "$ENG" ${SESS:+--add-dir "$SESS"} \
     --permission-mode acceptEdits \
     --output-format stream-json --verbose \
@@ -121,9 +129,10 @@ else
   osascript >/dev/null 2>&1 <<OSA
 tell application "Terminal"
   activate
-  do script "cd '$ENG' && claude '$FIRST'"
+  do script "cd '$ENG' && claude --session-id '$SID' '$FIRST'"
 end tell
 OSA
   echo "[+] opened an interactive Claude Code session in Terminal, in $ENG"
+  echo "[*] session id: $SID  (resume later with: mp engage --resume $(basename "$ENG"))"
   echo "$ENG"
 fi

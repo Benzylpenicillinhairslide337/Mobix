@@ -166,8 +166,89 @@ def build_tree(rows: list[dict]) -> dict:
     return tree
 
 
-def recent_requests(limit: int = 2000, app: str = "") -> list[dict]:
-    s = active_session()
+def resolve_session(name: str = "") -> Path | None:
+    """An explicit archived session name, or the live one if blank/unmatched."""
+    if name:
+        p = LOOT / name
+        if p.is_dir() and re.match(r"^session-[0-9-]+$", name):
+            return p
+    return active_session()
+
+
+def session_target(d: Path) -> str:
+    tf = d / ".target"
+    if tf.exists():
+        return tf.read_text().strip()
+    # older sessions predate tagging - fall back to the dominant app in flows.jsonl
+    f = d / "flows.jsonl"
+    if not f.exists():
+        return ""
+    counts: dict[str, int] = {}
+    try:
+        for line in f.open():
+            try:
+                r = json.loads(line)
+            except Exception:
+                continue
+            a = r.get("app") or ""
+            if a:
+                counts[a] = counts.get(a, 0) + 1
+    except Exception:
+        pass
+    return max(counts, key=counts.get) if counts else ""
+
+
+def list_sessions_full() -> list[dict]:
+    out = []
+    live = active_session()
+    for d in sorted(LOOT.glob("session-*"), key=lambda p: p.stat().st_mtime, reverse=True):
+        if not d.is_dir():
+            continue
+        f = d / "flows.jsonl"
+        flows = 0
+        if f.exists():
+            try:
+                flows = sum(1 for _ in f.open())
+            except Exception:
+                pass
+        out.append({
+            "name": d.name, "target": session_target(d), "flows": flows,
+            "mtime": d.stat().st_mtime, "has_brief": (d / "BRIEF.md").exists(),
+            "live": live is not None and d.resolve() == live.resolve(),
+        })
+    return out
+
+
+def list_engagements_full() -> list[dict]:
+    out = []
+    base = ROOT / "engagements"
+    if not base.exists():
+        return out
+    for d in sorted((p for p in base.glob("*") if p.is_dir()),
+                     key=lambda p: p.stat().st_mtime, reverse=True):
+        pkg = d.name.rsplit("_", 1)[0] if "_" in d.name else d.name
+        sid_f = d / ".session_id"
+        mode_f = d / ".mode"
+        sid = sid_f.read_text().strip() if sid_f.exists() else ""
+        mode = mode_f.read_text().strip() if mode_f.exists() else ("auto" if (d / ".agent.pid").exists() else "")
+        fdir = d / "findings"
+        findings = len(list(fdir.glob("*.md"))) if fdir.exists() else 0
+        running = False
+        pidf = d / ".agent.pid"
+        if pidf.exists():
+            try:
+                os.kill(int(pidf.read_text().strip()), 0); running = True
+            except Exception:
+                running = False
+        out.append({
+            "name": d.name, "pkg": pkg, "mtime": d.stat().st_mtime,
+            "session_id": sid, "mode": mode, "findings": findings, "running": running,
+        })
+    return out
+
+
+def recent_requests(limit: int = 2000, app: str = "", session: str = "") -> list[dict]:
+    s = resolve_session(session)
     if not s:
         return []
     f = s / "flows.jsonl"
@@ -191,9 +272,9 @@ def recent_requests(limit: int = 2000, app: str = "") -> list[dict]:
     return rows[-limit:][::-1]
 
 
-def flow_detail(i: int) -> dict:
+def flow_detail(i: int, session: str = "") -> dict:
     """Everything captured for one request, with base64 bodies decoded."""
-    sess = active_session()
+    sess = resolve_session(session)
     if not sess:
         return {}
     f = sess / "flows.jsonl"
@@ -579,8 +660,8 @@ def bypass_set(key: str, on: bool) -> tuple[bool, str]:
     return rc == 0, ("" if rc == 0 else out)
 
 
-def apps_in_session() -> list[dict]:
-    s = active_session()
+def apps_in_session(session: str = "") -> list[dict]:
+    s = resolve_session(session)
     if not s or not (s / "flows.jsonl").exists():
         return []
     counts: dict[str, int] = {}
@@ -636,6 +717,12 @@ def run_action(action: str, arg: str) -> tuple[bool, str]:
         return rc == 0, out
     if action == "engage_stop":
         rc, out = sh([MP, "engage", "--stop"], 60)
+        return rc == 0, out
+    if action == "engage_resume":
+        name = arg.strip()
+        if not re.match(r"^[A-Za-z0-9_.-]{1,160}$", name) or not (ROOT / "engagements" / name).is_dir():
+            return False, "unknown engagement"
+        rc, out = sh([MP, "engage", "--resume", name], 30)
         return rc == 0, out
     if action in ("analyze_session", "analyze_flow"):
         return analyze_with_claude("flow" if action == "analyze_flow" else "session", arg)
@@ -825,6 +912,7 @@ h3{font-size:11px;text-transform:uppercase;letter-spacing:.07em;color:var(--mut)
   <button data-t="apps" onclick="tab('apps')">Apps</button>
   <button data-t="services" onclick="tab('services')">Services</button>
   <button data-t="engage" onclick="tab('engage')">Claude Analysis<span id="engnavdot" style="display:none" class="navdot"></span></button>
+  <button data-t="sessions" onclick="tab('sessions')">Sessions</button>
 </nav>
 
 <main>
@@ -1019,6 +1107,28 @@ h3{font-size:11px;text-transform:uppercase;letter-spacing:.07em;color:var(--mut)
       </div>
     </div>
   </section>
+
+  <!-- SESSIONS -->
+  <section id="t-sessions" class="tab">
+    <div class="bar">
+      <b>Sessions</b>
+      <span class="muted">every past capture + Claude Code engagement — nothing here is ever deleted by a new scan</span>
+      <div style="flex:1"></div>
+      <button onclick="loadSessions()">Refresh</button>
+    </div>
+    <div class="split">
+      <div class="list" style="padding:12px 14px">
+        <h3 style="margin-top:0">Capture sessions <span id="sessCount" class="muted" style="text-transform:none;font-weight:400"></span></h3>
+        <div id="sessList" class="applist"></div>
+        <h3>Claude Code engagements <span id="engListCount" class="muted" style="text-transform:none;font-weight:400"></span></h3>
+        <div id="engList" class="applist"></div>
+      </div>
+      <div class="gutter"></div>
+      <div class="detail" id="sessDetail" style="width:52%">
+        <div class="muted">Pick a capture session on the left to browse its requests read-only, or resume a past Claude Code engagement.</div>
+      </div>
+    </div>
+  </section>
 </main>
 
 <div id="log">ready</div>
@@ -1027,6 +1137,7 @@ h3{font-size:11px;text-transform:uppercase;letter-spacing:.07em;color:var(--mut)
 const $=id=>document.getElementById(id);
 let ROWS=[], APPS=[], SEL='', CUR=null;
 let TREEHOST=null, TREEPATH=[], TREE_OPEN=new Set(), TREE_INIT=false;
+let LAST_TARGET=null;
 
 function tkey(host,path){ return host+(path.length?'\u0001'+path.join('/'):''); }
 
@@ -1202,8 +1313,8 @@ function newRepeater(){
   $('repMethod').value='GET'; $('repUrl').value=''; $('repHeaders').value=''; $('repBody').value=''; $('repResign').checked=false;
   $('repResponse').innerHTML='<div class="muted">Blank request — fill this in and hit Send.</div>';
 }
-async function loadRepeaterFromFlow(i){
-  const d=await (await fetch('/api/flow?i='+i)).json();
+async function loadRepeaterFromFlow(i,session){
+  const d=await (await fetch('/api/flow?i='+i+(session?'&session='+encodeURIComponent(session):''))).json();
   if(!d||!d.i) return;
   $('repMethod').value=(d.method||'GET').toUpperCase();
   $('repUrl').value=d.scheme+'://'+d.host+d.path;
@@ -1255,7 +1366,7 @@ function loadRepHistory(idx){
 function theme(){const r=document.documentElement;const d=r.dataset.theme||(matchMedia('(prefers-color-scheme:dark)').matches?'dark':'light');r.dataset.theme=d==='dark'?'light':'dark'}
 function tab(n){document.querySelectorAll('.tab').forEach(e=>e.classList.remove('on'));$('t-'+n).classList.add('on');
   document.querySelectorAll('nav button').forEach(b=>b.classList.toggle('on',b.dataset.t===n));
-  if(n==='bypass')loadBypass(); if(n==='apps')loadApps(); if(n==='engage'){pollEng();var d=$('engnavdot');if(d)d.style.display='none';} if(n==='install')pollInstall(); if(n==='login'&&!CREDPKG)loadCredsForCurrentTarget(); if(n==='services')loadBurpStatus();}
+  if(n==='bypass')loadBypass(); if(n==='apps')loadApps(); if(n==='engage'){pollEng();var d=$('engnavdot');if(d)d.style.display='none';} if(n==='install')pollInstall(); if(n==='login'&&!CREDPKG)loadCredsForCurrentTarget(); if(n==='services')loadBurpStatus(); if(n==='sessions')loadSessions();}
 function dot(v){return `<span class="dot" style="background:${v?'var(--ok)':'var(--bad)'}"></span>`}
 function row(k,v){return `<div class="row"><b>${k}</b><span>${v}</span></div>`}
 function esc(s){return (s==null?'':String(s)).replace(/[&<>]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;'}[c]))}
@@ -1267,8 +1378,32 @@ function esc(s){return (s==null?'':String(s)).replace(/[&<>]/g,c=>({'&':'&amp;',
  addEventListener('mousemove',e=>{if(!drag)return;const w=innerWidth-e.clientX;
    if(w>280&&w<innerWidth-260)d.style.width=w+'px'})})();
 
+// Every client-side bit of state that's scoped to "the current target" and
+// would otherwise silently keep filtering/operating on the OLD app after a
+// scan/switch/target_switch (from the CLI, dashboard, or an MCP tool - they
+// all just change TARGET in config, which /api/status reflects either way).
+// Reproduced without this: a stale tree-filter chip left the Traffic tab
+// showing "no traffic captured yet" for a live, correctly-hooked new target,
+// and the Login tab kept editing the OLD package's stored credentials.
+function onTargetChanged(oldT, newT){
+  TREEHOST=null; TREEPATH=[]; TREE_OPEN=new Set(); TREE_INIT=false;
+  const chip=$('treechip'); if(chip) chip.innerHTML='';
+  CUR=null;
+  const d=$('detail');
+  if(d) d.innerHTML='<div class="muted">Select a request to inspect it here — headers, body, decoded payloads and response.</div>';
+  const af=$('appfilter'); if(af) af.value='';
+  const q=$('q'); if(q) q.value='';
+  CREDPKG=''; CREDFIELDS=[];
+  if(document.querySelector('#t-login.on')) loadCredsForCurrentTarget();
+  loadReqs();
+  pollEng();
+  $('log').textContent='target changed: '+(oldT||'(none)')+' → '+newT+' — traffic/login view reset for the new target';
+}
+
 async function load(){
   const s=await (await fetch('/api/status')).json();
+  if(LAST_TARGET!==null && s.target && s.target!==LAST_TARGET) onTargetChanged(LAST_TARGET, s.target);
+  LAST_TARGET = s.target || '';
   $('hdr').innerHTML = s.online?`${dot(true)}${s.device} · Android ${s.android}`:`${dot(false)}emulator offline`;
   $('tgtpill').innerHTML = s.target?`${dot(s.hooks)}${s.target}${s.scope?' · '+s.scope:''}`:'<span class="warn">no target</span>';
   $('env').innerHTML = row('device',s.online?s.device:'<span class="bad">offline</span>')+
@@ -1280,7 +1415,7 @@ async function load(){
     row('mitmweb :8081',s.mitmweb?'<span class="ok">up</span>':'down')+
     row('MobSF :8010',s.mobsf?'<span class="ok">up</span>':'down')+
     row('session',s.session||'—')+row('flows',s.flows);
-  SEL=SEL||s.target;
+  SEL=s.target||SEL;
 }
 
 async function loadReqs(){
@@ -1310,11 +1445,8 @@ function render(){
     <td class="p" title="${esc(r.path)}">${esc(r.path)}</td>
     <td>${esc(r.app)||'<span class="muted">—</span>'}</td><td>${esc(r.flags)}</td></tr>`).join('');
 }
-async function show(i,tr){
-  CUR=i; document.querySelectorAll('#reqs tr').forEach(x=>x.classList.remove('sel'));
-  if(tr)tr.classList.add('sel');
-  const d=await (await fetch('/api/flow?i='+i)).json();
-  if(!d||!d.i){$('detail').innerHTML='<div class="muted">not found</div>';return}
+function flowDetailHTML(d, opts){
+  opts=opts||{};
   const hdrs=o=>Object.entries(o||{}).map(([k,v])=>`${esc(k)}: ${esc(v)}`).join('\n')||'(none)';
   let h=`<div style="font-family:ui-monospace,monospace;font-size:13px;word-break:break-all">
       <b>${esc(d.method)}</b> ${esc(d.scheme)}://${esc(d.host)}${esc(d.path)}</div>
@@ -1322,16 +1454,83 @@ async function show(i,tr){
       ${d.app?' · '+esc(d.app):''}${d.authenticated?' · auth '+esc(d.auth_scheme):' · <span class="warn">unauthenticated</span>'}</div>`;
   if((d.idor_candidates||[]).length) h+=`<h3>Object references (IDOR candidates)</h3><pre>${esc(d.idor_candidates.join('\n'))}</pre>`;
   if((d.flag_types||[]).length) h+=`<h3>Flags</h3><pre>${esc(d.flag_types.join(', '))}</pre>`;
-  h+=`<div style="margin-top:8px;display:flex;gap:8px;flex-wrap:wrap">
+  if(!opts.readonly) h+=`<div style="margin-top:8px;display:flex;gap:8px;flex-wrap:wrap">
       <button class="primary" onclick="analyze('flow',${d.i})">Analyse this request with Claude</button>
       <button onclick="loadRepeaterFromFlow(${d.i})">Repeat this request</button></div>`;
+  else h+=`<div style="margin-top:8px;display:flex;gap:8px;flex-wrap:wrap">
+      <button onclick="loadRepeaterFromFlow(${d.i},'${esc(opts.session||'')}')">Repeat this request</button></div>`;
   h+=`<h3>Request headers</h3><pre>${esc(hdrs(d.req_headers))}</pre>`;
   if(d.req_pretty) h+=`<h3>Request body</h3><pre>${esc(d.req_pretty)}</pre>`;
   (d.req_decoded||[]).forEach(x=>h+=`<h3>Request · ${esc(x.field)} decoded</h3><pre>${esc(x.decoded)}</pre>`);
   h+=`<h3>Response headers</h3><pre>${esc(hdrs(d.res_headers))}</pre>`;
   if(d.res_pretty) h+=`<h3>Response body</h3><pre>${esc(d.res_pretty)}</pre>`;
   (d.res_decoded||[]).forEach(x=>h+=`<h3>Response · ${esc(x.field)} decoded</h3><pre>${esc(x.decoded)}</pre>`);
-  $('detail').innerHTML=h;
+  return h;
+}
+async function show(i,tr){
+  CUR=i; document.querySelectorAll('#reqs tr').forEach(x=>x.classList.remove('sel'));
+  if(tr)tr.classList.add('sel');
+  const d=await (await fetch('/api/flow?i='+i)).json();
+  if(!d||!d.i){$('detail').innerHTML='<div class="muted">not found</div>';return}
+  $('detail').innerHTML=flowDetailHTML(d);
+}
+
+// ---------------------------------------------------------------- SESSIONS
+// Every past capture session and Claude Code engagement, browsable
+// read-only - nothing here is touched by a new scan, so it's always safe
+// to come back to. Deliberately separate from the live Traffic tab's state
+// (ROWS/TREEHOST/etc.) rather than a "viewing mode" flag on it, so the
+// live auto-refresh loops there can never clobber an archived view.
+let SESSDATA={sessions:[],engagements:[]}, VIEWSESS=null;
+function agoText(sec){
+  if(sec<60) return Math.max(0,Math.round(sec))+'s ago';
+  const m=Math.round(sec/60); if(m<60) return m+'m ago';
+  const h=Math.round(m/60); if(h<24) return h+'h ago';
+  return Math.round(h/24)+'d ago';
+}
+function renderSessLists(){
+  const now=Date.now()/1000;
+  $('sessCount').textContent='('+SESSDATA.sessions.length+')';
+  $('engListCount').textContent='('+SESSDATA.engagements.length+')';
+  $('sessList').innerHTML=SESSDATA.sessions.map(s=>
+    '<div class="app'+(s.name===VIEWSESS?' sel':'')+'" onclick="viewSession(\''+esc(s.name)+'\')">'
+    +'<span>'+(esc(s.target)||'<span class="muted">(unknown target)</span>')+(s.live?' <b class="ok">live</b>':'')+'</span>'
+    +'<small>'+s.flows+' flows · '+agoText(now-s.mtime)+'</small></div>').join('') || '<div class="muted">none yet</div>';
+  $('engList').innerHTML=SESSDATA.engagements.map(e=>
+    '<div class="app"><span>'+esc(e.pkg)+' <small class="muted">'+esc(e.mode||'?')+'</small>'+(e.running?' <b class="ok">running</b>':'')+'</span>'
+    +'<small>'+e.findings+' finding'+(e.findings===1?'':'s')+' · '+agoText(now-e.mtime)
+    +(e.session_id?' · <a href="javascript:resumeEngagement(\''+esc(e.name)+'\')">resume</a>':' · not resumable')
+    +'</small></div>').join('') || '<div class="muted">none yet</div>';
+}
+async function loadSessions(){
+  SESSDATA=await (await fetch('/api/all_sessions')).json();
+  renderSessLists();
+}
+async function viewSession(name){
+  VIEWSESS=name; renderSessLists();
+  $('sessDetail').innerHTML='<div class="muted">loading…</div>';
+  const rows=await (await fetch('/api/requests?session='+encodeURIComponent(name))).json();
+  const meta=SESSDATA.sessions.find(s=>s.name===name)||{};
+  let h='<div class="muted" style="margin-bottom:8px">'+esc(name)+' · '+esc(meta.target||'unknown target')+' · '+rows.length+' requests'
+    +(meta.live?' · <b class="ok">this is the live session</b>':' · archived, read-only')+'</div>';
+  h+='<table style="width:100%"><thead><tr><th>#</th><th>st</th><th>method</th><th>host</th><th>path</th></tr></thead><tbody>'
+    +rows.slice(0,300).map(r=>'<tr onclick="showSessFlow(\''+esc(name)+'\','+r.i+')" style="cursor:pointer">'
+      +'<td>'+r.i+'</td><td>'+(r.status??'')+'</td><td>'+esc(r.method)+'</td><td>'+esc(r.host)+'</td>'
+      +'<td class="p" title="'+esc(r.path)+'">'+esc(r.path)+'</td></tr>').join('')
+    +'</tbody></table>'
+    +(rows.length>300?'<div class="muted" style="margin-top:8px">showing the most recent 300 of '+rows.length+'</div>':'');
+  $('sessDetail').innerHTML=h;
+}
+async function showSessFlow(name,i){
+  const d=await (await fetch('/api/flow?i='+i+'&session='+encodeURIComponent(name))).json();
+  if(!d||!d.i){$('sessDetail').innerHTML='<div class="muted">not found</div>';return}
+  $('sessDetail').innerHTML='<button onclick="viewSession(\''+esc(name)+'\')">← back to '+esc(name)+'</button>'+flowDetailHTML(d,{readonly:true,session:name});
+}
+async function resumeEngagement(name){
+  $('log').textContent='resuming '+name+'…';
+  const r=await (await fetch('/api/action',{method:'POST',headers:{'content-type':'application/json'},
+    body:JSON.stringify({action:'engage_resume',arg:name})})).json();
+  $('log').textContent=(r.ok?'':'FAILED\n')+(r.out||'done');
 }
 
 async function analyze(kind,i){
@@ -1520,7 +1719,8 @@ class H(BaseHTTPRequestHandler):
         if u.path == "/api/apps":
             return self._send(200, json.dumps(emulator_apps()))
         if u.path == "/api/seen":
-            return self._send(200, json.dumps(apps_in_session()))
+            q = parse_qs(u.query)
+            return self._send(200, json.dumps(apps_in_session(session=(q.get("session") or [""])[0])))
         if u.path == "/api/scan_status":
             lp = scan_log_path()
             txt = ""
@@ -1586,7 +1786,8 @@ class H(BaseHTTPRequestHandler):
         if u.path == "/api/tree":
             q = parse_qs(u.query)
             app_f = (q.get("app") or [""])[0]
-            rows = recent_requests(app=app_f)
+            sess_f = (q.get("session") or [""])[0]
+            rows = recent_requests(app=app_f, session=sess_f)
             return self._send(200, json.dumps(build_tree(rows)))
         if u.path == "/api/bypass":
             return self._send(200, json.dumps(bypass_catalog()))
@@ -1596,10 +1797,15 @@ class H(BaseHTTPRequestHandler):
                 i = int((q.get("i") or ["0"])[0])
             except ValueError:
                 return self._send(400, json.dumps({"error": "bad index"}))
-            return self._send(200, json.dumps(flow_detail(i)))
+            sess_f = (q.get("session") or [""])[0]
+            return self._send(200, json.dumps(flow_detail(i, session=sess_f)))
         if u.path == "/api/requests":
             q = parse_qs(u.query)
-            return self._send(200, json.dumps(recent_requests(app=(q.get("app") or [""])[0])))
+            sess_f = (q.get("session") or [""])[0]
+            return self._send(200, json.dumps(recent_requests(app=(q.get("app") or [""])[0], session=sess_f)))
+        if u.path == "/api/all_sessions":
+            return self._send(200, json.dumps({"sessions": list_sessions_full(),
+                                               "engagements": list_engagements_full()}))
         return self._send(404, json.dumps({"error": "not found"}))
 
     def do_POST(self):

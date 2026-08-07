@@ -387,6 +387,65 @@ def t_engage_stop(_) -> str:
     return result(rc == 0, out)
 
 
+def t_engage_resume(a: dict) -> str:
+    """Reopens a Terminal window running `claude --resume <id>` in that
+    engagement's folder - same as the dashboard's Sessions tab Resume link."""
+    name = a.get("name") or ""
+    if not re.match(r"^[A-Za-z0-9_.-]{1,160}$", name) or not (ROOT / "engagements" / name).is_dir():
+        return bad("unknown engagement - see lab_sessions for valid names")
+    rc, out = sh([MP, "engage", "--resume", name], 30)
+    return result(rc == 0, out)
+
+
+def session_target(d: Path) -> str:
+    tf = d / ".target"
+    if tf.exists():
+        return tf.read_text().strip()
+    rows = load(d)
+    counts: dict[str, int] = {}
+    for r in rows:
+        a = r.get("app") or ""
+        if a:
+            counts[a] = counts.get(a, 0) + 1
+    return max(counts, key=counts.get) if counts else ""
+
+
+def t_lab_sessions(_) -> str:
+    """Every past capture session (target, flow count, age) and Claude Code
+    engagement (mode, findings, resumable session id) - nothing here is ever
+    deleted by a new scan. Pass an engagement's 'name' to engage_resume."""
+    live = live_session()
+    sess_out = []
+    for d in sessions():
+        rows = load(d)
+        sess_out.append({
+            "name": d.name, "target": session_target(d), "flows": len(rows),
+            "live": live is not None and d.resolve() == live.resolve(),
+        })
+    eng_out = []
+    base = ROOT / "engagements"
+    if base.exists():
+        for d in sorted((p for p in base.glob("*") if p.is_dir()),
+                         key=lambda p: p.stat().st_mtime, reverse=True):
+            pkg = d.name.rsplit("_", 1)[0] if "_" in d.name else d.name
+            sid_f, mode_f, pid_f = d / ".session_id", d / ".mode", d / ".agent.pid"
+            fdir = d / "findings"
+            running = False
+            if pid_f.exists():
+                try:
+                    os.kill(int(pid_f.read_text().strip()), 0); running = True
+                except Exception:
+                    running = False
+            eng_out.append({
+                "name": d.name, "pkg": pkg,
+                "session_id": sid_f.read_text().strip() if sid_f.exists() else "",
+                "mode": mode_f.read_text().strip() if mode_f.exists() else "",
+                "findings": len(list(fdir.glob("*.md"))) if fdir.exists() else 0,
+                "running": running,
+            })
+    return json.dumps({"sessions": sess_out, "engagements": eng_out}, indent=2)
+
+
 # ---------------------------------------------------------------- credentials
 # No tool here ever returns a stored plaintext password/TOTP secret - see the
 # module docstring. creds_list mirrors `creds.py show` (masked); creds_send
@@ -757,6 +816,22 @@ TOOLS = [
      "description": "Stop any running engagement agents.",
      "inputSchema": {"type": "object", "properties": {}},
      "fn": t_engage_stop},
+    {"name": "engage_resume",
+     "description": "Resume a past Claude Code engagement conversation (interactive or auto) by "
+                    "its engagement folder name, from lab_sessions - reopens a Terminal window "
+                    "with `claude --resume <id>` in that folder. Fails if it predates resume "
+                    "support (no saved session id).",
+     "inputSchema": {"type": "object", "properties": {"name": {"type": "string",
+                     "description": "engagement folder name, e.g. com.example.app_20260101-120000"}},
+                     "required": ["name"]},
+     "fn": t_engage_resume},
+    {"name": "lab_sessions",
+     "description": "Every past capture session (target, flow count, live or archived) and every "
+                    "Claude Code engagement (mode, findings count, running, resumable session id) "
+                    "- nothing here is ever deleted by a new scan. Use traffic_flows/traffic_flow "
+                    "with a session name to browse an archived session's requests.",
+     "inputSchema": {"type": "object", "properties": {}},
+     "fn": t_lab_sessions},
     {"name": "engage_findings",
      "description": "Findings written by the most recent engagement (interactive or auto), newest "
                     "first. Returns a short excerpt per finding by default; pass full_text for the "

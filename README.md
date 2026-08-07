@@ -117,7 +117,7 @@ cert, it doesn't touch a running capture.
 mp dash            # http://127.0.0.1:8090
 ```
 
-Eight tabs:
+Nine tabs:
 
 **Install** — upload an APK/bundle or paste a link/Play Store URL; runs static
 analysis and (unless passive) hooks it with a live capture. Log streams on the
@@ -155,6 +155,10 @@ remaining actions.
 **Claude Analysis** — the live findings list from an `mp engage` run (interactive
 or `--auto`), with a hero card for the latest finding and a live-activity feed.
 See [Claude Code engagements](#claude-code-engagements-mp-engage).
+
+**Sessions** — every past capture session and Claude Code engagement, browsable
+read-only, forever — a new scan never deletes anything. See
+[Sessions & resuming](#sessions--resuming) below.
 
 The **Emulator apps** panel lists packages installed on the *Android device*
 (`pm list packages -3`), marks which are running, and sets the target on click.
@@ -510,6 +514,51 @@ Note: the agent's first message can trip the broad model safeguard on
 cyber-security phrasing; it auto-falls-back to another model and continues. The
 prompt is framed as a security review of already-captured data to minimise this.
 
+## Sessions & resuming
+
+Every `mp scan`/`mp switch` starts a **fresh** capture session — but never
+deletes the old one. `loot/session-<timestamp>/` directories accumulate
+forever (clean them up by hand if disk space matters); nothing in this lab
+ever removes a past session automatically.
+
+**Dashboard.** The **Sessions** tab lists every capture session (target app,
+flow count, age — the live one is marked) and every Claude Code engagement
+(mode, finding count, running/not, a **resume** link when it has one). Click a
+session to browse its requests read-only — same detail view as Traffic, minus
+the live-only actions (no "Analyse with Claude", since that targets the live
+session; "Repeat this request" still works, fetching from the archived one).
+
+**CLI.** `mp sessions` lists the 15 most recent capture sessions with their
+tagged target, flow count, and disk size, plus a count of Claude Code
+engagements.
+
+**Resuming an engagement.** Every `mp engage` run (interactive or `--auto`)
+now pins a `claude --session-id` and saves it to `.session_id` in the
+engagement folder. Pick it back up any time:
+
+```bash
+mp engage --resume <engagement-dir-name>   # e.g. com.example.app_20260101-120000
+```
+
+opens a new Terminal window running `claude --resume <id>` in that folder —
+full prior context restored. The dashboard's Sessions tab does the same via
+its **resume** link. Engagements from before this feature existed have no
+saved session id and show "not resumable".
+
+**Every tab resets cleanly on a target change.** Switching target — via `mp
+scan`/`mp switch`, the dashboard's New Scan, or the MCP `target_scan`/
+`target_switch` tools, all three go through the same `config` file the
+dashboard polls — clears the Traffic tab's tree filter and selected request,
+reloads the Login tab for the new package, and refreshes the findings view.
+Previously a stale tree filter or an already-open Login tab could keep
+showing the *old* target's view even though capture had correctly moved to
+the new one, which looked exactly like "still stuck on the old app" — the
+same class of bug as the automatic-scope-clearing gotcha (see
+[Gotchas](#gotchas)), just on the dashboard's client side instead of the
+capture backend. The Repeater's loaded request/history is deliberately
+**not** reset — it's for replaying any captured request regardless of what's
+currently live.
+
 ## Logging in
 
 MuMu Player Pro is already a normal window on your Mac — click into it and
@@ -599,7 +648,7 @@ same care as `replay.py --send`: know what you're sending before you click it.
 Three routes, increasing directness:
 
 **1. MCP server — full control plane.** `bin/mp-mcp` is a single MCP server
-(34 tools) covering both traffic analysis and everything the CLI/dashboard can
+(36 tools) covering both traffic analysis and everything the CLI/dashboard can
 do — register it once and drive the whole lab from chat:
 
 ```bash
@@ -616,7 +665,8 @@ same binary, same tools, just a different local alias. No need to re-add.)*
 | targeting | `target_set` `target_switch` `target_scan` `target_scope` `target_install` `target_pull` `target_launch` `target_static` | set/switch/scan the target (same flow as `mp scan`/New Scan — force-stops the old capture, starts fresh), install an app, pull its APK, static analysis |
 | bypass | `bypass_list` `bypass_set` `bypass_reset` | read/toggle the Frida scripts and anti-detection modules |
 | Burp / MobSF | `burp_switch` `burp_mitm` `mobsf_start` | hand traffic to Burp and back, start MobSF |
-| engagements | `engage_start` `engage_stop` `engage_findings` | start/stop a Claude Code engagement, read back its findings |
+| engagements | `engage_start` `engage_stop` `engage_findings` `engage_resume` | start/stop a Claude Code engagement, read back its findings, resume a past one by session id |
+| sessions | `lab_sessions` | every past capture session (target, flow count, live/archived) and engagement (mode, findings, resumable session id) — nothing here is ever deleted by a new scan |
 | credentials | `creds_list` `creds_set` `creds_remove` `creds_send` `creds_bring_front` | manage stored test creds and push a value into a focused device field — **never returns a stored plaintext password/TOTP secret**, see below |
 
 Just ask: *"use target_scan to start a fresh scan on com.example.app"* or *"use
@@ -828,6 +878,15 @@ the session survives without a TTY.
   you're waiting. Pin one with `MP_DEVICE_FORCE` if you ever need to.
 - MobSF's container reports `unhealthy` for the first minute or so while it
   builds its DB. It still serves.
+- **Switching target auto-clears a leftover scope.** A scope set for the
+  *previous* app's hosts silently filters the new target's traffic out of the
+  analysis feed entirely — flows still land in `flows.mitm`, but
+  `flows.jsonl`/the dashboard/`traffic_flows` show nothing, which looks
+  exactly like capture is stuck on the old app. `mp scan`/`mp switch` detect a
+  target change and clear `SCOPE` automatically (with a warning); re-set it
+  with `mp scope <host>` once you know the new target's hosts. See
+  [Sessions & resuming](#sessions--resuming) for the matching dashboard-side
+  fix (stale tree filter / Login tab showing the old target).
 
 ## Scope discipline
 

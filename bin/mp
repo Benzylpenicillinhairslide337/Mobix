@@ -324,6 +324,7 @@ cmd_scan() {
     c_dim "      scope: $SCOPE"
   fi
   local ts sess; ts=$(date +%Y%m%d-%H%M%S); sess="$MP_LOOT/session-$ts"; mkdir -p "$sess"
+  echo "$pkg" > "$sess/.target"
   local feed=( -s "$SCRIPTS/mpfeed.py" --set feedout="$sess" )
   [ -n "$SCOPE" ] && feed+=( --set feedscope="$SCOPE" )
   nohup mitmdump --listen-host 0.0.0.0 --listen-port "$MP_PROXY_PORT" \
@@ -390,6 +391,7 @@ cmd_go() {
     [ -n "$sess" ] && c_dim "  traffic -> $sess"
   else
     ts=$(date +%Y%m%d-%H%M%S); sess="$MP_LOOT/session-$ts"; mkdir -p "$sess"
+    echo "$TARGET" > "$sess/.target"
     local feed=( -s "$SCRIPTS/mpfeed.py" --set feedout="$sess" )
     [ -n "$SCOPE" ] && feed+=( --set feedscope="$SCOPE" )
     nohup mitmdump --listen-host 0.0.0.0 --listen-port "$MP_PROXY_PORT" \
@@ -527,11 +529,14 @@ cmd_analyze() {
 cmd_sessions() {
   local n=0
   for d in $(ls -td "$MP_LOOT"/session-* 2>/dev/null); do
-    local f; f=$(wc -l < "$d/flows.jsonl" 2>/dev/null || echo 0)
-    printf "  %-28s %5s flows  %s\n" "$(basename "$d")" "$f" "$(du -sh "$d" 2>/dev/null | cut -f1)"
+    local f tgt; f=$(wc -l < "$d/flows.jsonl" 2>/dev/null || echo 0)
+    tgt=$(cat "$d/.target" 2>/dev/null || echo "?")
+    printf "  %-28s %-28s %5s flows  %s\n" "$(basename "$d")" "$tgt" "$f" "$(du -sh "$d" 2>/dev/null | cut -f1)"
     n=$((n+1)); [ $n -ge 15 ] && break
   done
   [ $n -eq 0 ] && c_dim "  no sessions yet"
+  local ne; ne=$(ls -d "$MP_ROOT"/engagements/*/ 2>/dev/null | wc -l | tr -d ' ')
+  [ "$ne" -gt 0 ] 2>/dev/null && c_dim "  $ne Claude Code engagement(s) - see the dashboard's Sessions tab, or: mp engage --resume <name>"
   return 0
 }
 
@@ -546,6 +551,22 @@ cmd_engage() {
     done
     pkill -f "claude -p" 2>/dev/null
     c_ok "stopped $n engagement agent(s)"; return 0
+  fi
+  if [ "${1:-}" = "--resume" ]; then
+    local name="${2:-}" eng sid
+    [ -z "$name" ] && { c_err "usage: mp engage --resume <engagement-dir-name>   (see: mp sessions)"; exit 1; }
+    eng="$MP_ROOT/engagements/$name"
+    [ -d "$eng" ] || { c_err "no engagement folder: $eng"; exit 1; }
+    sid=$(cat "$eng/.session_id" 2>/dev/null)
+    [ -z "$sid" ] && { c_err "$name has no saved session id (created before resume support, or auto mode never opened interactively)"; exit 1; }
+    osascript >/dev/null 2>&1 <<OSA
+tell application "Terminal"
+  activate
+  do script "cd '$eng' && claude --resume '$sid'"
+end tell
+OSA
+    c_ok "resuming $name (session $sid) in Terminal"
+    return 0
   fi
   "$SCRIPTS/engage.sh" "$@"
 }
@@ -620,6 +641,7 @@ mp - MuMu Android pentest lab
   mp engage [pkg]          full Claude Code session in a target folder
   mp engage [pkg] --auto   headless agent that reviews the live traffic
   mp engage --stop         stop running engagement agents
+  mp engage --resume <name>  pick a past engagement back up (see: mp sessions)
   mp analyze [session]     full feed (index/surface/flags) + brief
   mp sessions              list capture sessions
   mp static [apk]          static analysis only (apktool + jadx + apkleaks)
